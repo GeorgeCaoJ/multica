@@ -1,19 +1,33 @@
 "use client";
 
 import type { ReactNode } from "react";
-import { useRef, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { cn } from "@multica/ui/lib/utils";
-import { ContentEditor, type ContentEditorRef } from "../../editor";
+import {
+  ContentEditor,
+  type ContentEditorRef,
+  useFileDropZone,
+  FileDropOverlay,
+} from "../../editor";
+import { FileUploadButton } from "@multica/ui/components/common/file-upload-button";
 import { SubmitButton } from "@multica/ui/components/common/submit-button";
 import { useChatStore, DRAFT_NEW_SESSION } from "@multica/core/chat";
 import { createLogger } from "@multica/core/logger";
 import { enterKey, formatShortcut, modKey } from "@multica/core/platform";
+import type { UploadResult } from "@multica/core/hooks/use-file-upload";
 import { useT } from "../../i18n";
 
 const logger = createLogger("chat.ui");
 
 interface ChatInputProps {
-  onSend: (content: string) => void;
+  onSend: (content: string, attachmentIds?: string[]) => void;
+  /** Receives a File and returns the attachment row (with id + CDN link).
+   *  The wrapper owner (ChatWindow) lazy-creates a chat_session if needed
+   *  and forwards `chatSessionId` to the upload — chat-input only cares
+   *  about the upload result so it can map URL → id for back-fill on send.
+   *  When unset, paste/drag/button still type into the editor but no upload
+   *  fires (the editor's file-upload extension is a no-op without a handler). */
+  onUploadFile?: (file: File) => Promise<UploadResult | null>;
   onStop?: () => void;
   isRunning?: boolean;
   disabled?: boolean;
@@ -34,6 +48,7 @@ interface ChatInputProps {
 
 export function ChatInput({
   onSend,
+  onUploadFile,
   onStop,
   isRunning,
   disabled,
@@ -61,6 +76,29 @@ export function ChatInput({
   const clearInputDraft = useChatStore((s) => s.clearInputDraft);
   const [isEmpty, setIsEmpty] = useState(!inputDraft.trim());
 
+  // Maps "CDN URL inserted into the editor" → "attachment row id" so that
+  // on send we can ask the server to bind only the attachments still
+  // referenced in the message body. Cleared after every send. Mirrors the
+  // comment-input flow exactly.
+  const uploadMapRef = useRef<Map<string, string>>(new Map());
+
+  const handleUpload = useCallback(
+    async (file: File): Promise<UploadResult | null> => {
+      if (!onUploadFile) return null;
+      const result = await onUploadFile(file);
+      if (result) uploadMapRef.current.set(result.link, result.id);
+      return result;
+    },
+    [onUploadFile],
+  );
+
+  // Drop zone wraps the rounded card so a drop anywhere on the input
+  // surface routes the file through the editor's upload extension (same
+  // handler as the in-editor paste path).
+  const { isDragOver, dropZoneProps } = useFileDropZone({
+    onDrop: (files) => files.forEach((f) => editorRef.current?.uploadFile(f)),
+  });
+
   const handleSend = () => {
     const content = editorRef.current?.getMarkdown()?.replace(/(\n\s*)+$/, "").trim();
     if (!content || isRunning || disabled || noAgent) {
@@ -72,12 +110,22 @@ export function ChatInput({
       });
       return;
     }
+    // Only send attachment IDs for uploads still present in the content.
+    // Edits / deletions that remove the markdown URL also drop the binding.
+    const activeIds: string[] = [];
+    for (const [url, id] of uploadMapRef.current) {
+      if (content.includes(url)) activeIds.push(id);
+    }
     // Capture draft key BEFORE onSend — creating a new session mutates
     // activeSessionId synchronously, so reading it after onSend would point
     // at the new session and leave the old draft orphaned.
     const keyAtSend = draftKey;
-    logger.info("input.send", { contentLength: content.length, draftKey: keyAtSend });
-    onSend(content);
+    logger.info("input.send", {
+      contentLength: content.length,
+      draftKey: keyAtSend,
+      attachmentCount: activeIds.length,
+    });
+    onSend(content, activeIds.length > 0 ? activeIds : undefined);
     editorRef.current?.clearContent();
     // Drop focus so the caret doesn't keep blinking under the StatusPill /
     // streaming reply that's about to take over the user's attention. The
@@ -88,6 +136,7 @@ export function ChatInput({
     // a fair price for not stealing focus mid-action.
     editorRef.current?.blur();
     clearInputDraft(keyAtSend);
+    uploadMapRef.current.clear();
     setIsEmpty(true);
   };
 
@@ -98,6 +147,8 @@ export function ChatInput({
       : agentName
         ? t(($) => $.input.placeholder_named, { name: agentName })
         : t(($) => $.input.placeholder_default);
+
+  const uploadEnabled = !!onUploadFile && !disabled && !noAgent;
 
   return (
     <div
@@ -111,6 +162,7 @@ export function ChatInput({
       )}
     >
       <div
+        {...(uploadEnabled ? dropZoneProps : {})}
         className={cn(
           "relative mx-auto flex min-h-16 max-h-40 w-full max-w-4xl flex-col rounded-lg bg-card pb-9 border-1 border-border transition-colors focus-within:border-brand",
           // Visual + interaction lock when there's no agent. We don't
@@ -137,6 +189,7 @@ export function ChatInput({
               setInputDraft(draftKey, md);
             }}
             onSubmit={handleSend}
+            onUploadFile={uploadEnabled ? handleUpload : undefined}
             debounceMs={100}
             // Chat is short-form — the floating formatting toolbar is
             // more distraction than feature here.
@@ -152,8 +205,14 @@ export function ChatInput({
             {leftAdornment}
           </div>
         )}
-        <div className="absolute bottom-1 right-1.5 flex items-center gap-2">
+        <div className="absolute bottom-1 right-1.5 flex items-center gap-1">
           {rightAdornment}
+          {uploadEnabled && (
+            <FileUploadButton
+              size="sm"
+              onSelect={(file) => editorRef.current?.uploadFile(file)}
+            />
+          )}
           <SubmitButton
             onClick={handleSend}
             disabled={isEmpty || !!disabled || !!noAgent}
@@ -163,6 +222,7 @@ export function ChatInput({
             stopTooltip={t(($) => $.input.stop_tooltip)}
           />
         </div>
+        {uploadEnabled && isDragOver && <FileDropOverlay />}
       </div>
     </div>
   );

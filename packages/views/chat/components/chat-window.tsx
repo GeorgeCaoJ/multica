@@ -31,6 +31,7 @@ import { agentListOptions, memberListOptions } from "@multica/core/workspace/que
 import { canAssignAgent } from "@multica/views/issues/components";
 import { api } from "@multica/core/api";
 import { useAgentPresenceDetail, useWorkspaceAgentAvailability } from "@multica/core/agents";
+import { useFileUpload } from "@multica/core/hooks/use-file-upload";
 import { ActorAvatar } from "../../common/actor-avatar";
 import { OfflineBanner } from "./offline-banner";
 import { NoAgentBanner } from "./no-agent-banner";
@@ -189,8 +190,43 @@ export function ChatWindow() {
   // (focus mode tracks the user's page, not a per-message attachment).
   const { candidate: anchorCandidate } = useRouteAnchorCandidate(wsId);
 
+  const { uploadWithToast } = useFileUpload(api);
+
+  // Lazy-creates a chat_session the first time the user needs an id —
+  // either to send a message or to attach an uploaded file. Pulled out of
+  // handleSend so the upload path (which fires before any text exists) can
+  // get a session_id to hang the attachment on. Returns null when no agent
+  // is available; callers must early-return in that case.
+  //
+  // titleSeed is the first 50 chars of the user's message when called from
+  // send; the upload path passes "" and we fall back to "New chat" as a
+  // placeholder. A follow-up task may back-fill the real title from the
+  // first user message, but this keeps the session list scannable today.
+  const ensureSession = useCallback(
+    async (titleSeed: string): Promise<string | null> => {
+      if (activeSessionId) return activeSessionId;
+      if (!activeAgent) return null;
+      const session = await createSession.mutateAsync({
+        agent_id: activeAgent.id,
+        title: titleSeed.slice(0, 50) || "New chat",
+      });
+      setActiveSession(session.id);
+      return session.id;
+    },
+    [activeSessionId, activeAgent, createSession, setActiveSession],
+  );
+
+  const handleUploadFile = useCallback(
+    async (file: File) => {
+      const sessionId = await ensureSession("");
+      if (!sessionId) return null;
+      return uploadWithToast(file, { chatSessionId: sessionId });
+    },
+    [ensureSession, uploadWithToast],
+  );
+
   const handleSend = useCallback(
-    async (content: string) => {
+    async (content: string, attachmentIds?: string[]) => {
       if (!activeAgent) {
         apiLogger.warn("sendChatMessage skipped: no active agent");
         return;
@@ -201,24 +237,21 @@ export function ChatWindow() {
         ? `${buildAnchorMarkdown(anchorCandidate)}\n\n${content}`
         : content;
 
-      let sessionId = activeSessionId;
-      const isNewSession = !sessionId;
+      const isNewSession = !activeSessionId;
 
       apiLogger.info("sendChatMessage.start", {
-        sessionId,
+        sessionId: activeSessionId,
         isNewSession,
         agentId: activeAgent.id,
         contentLength: finalContent.length,
         hasAnchor: focusOn && !!anchorCandidate,
+        attachmentCount: attachmentIds?.length ?? 0,
       });
 
+      const sessionId = await ensureSession(finalContent);
       if (!sessionId) {
-        const session = await createSession.mutateAsync({
-          agent_id: activeAgent.id,
-          title: finalContent.slice(0, 50),
-        });
-        sessionId = session.id;
-        setActiveSession(sessionId);
+        apiLogger.warn("sendChatMessage aborted: ensureSession returned null");
+        return;
       }
 
       // Optimistic burst — everything that gives the user "I sent a message
@@ -251,7 +284,7 @@ export function ChatWindow() {
       });
       apiLogger.debug("sendChatMessage.optimistic", { sessionId, optimisticId: optimistic.id });
 
-      const result = await api.sendChatMessage(sessionId, finalContent);
+      const result = await api.sendChatMessage(sessionId, finalContent, attachmentIds);
       apiLogger.info("sendChatMessage.success", {
         sessionId,
         messageId: result.message_id,
@@ -271,8 +304,7 @@ export function ChatWindow() {
       activeSessionId,
       activeAgent,
       anchorCandidate,
-      createSession,
-      setActiveSession,
+      ensureSession,
       qc,
     ],
   );
@@ -494,6 +526,7 @@ export function ChatWindow() {
        *  when there's no agent (the EmptyState above carries the CTA). */}
       <ChatInput
         onSend={handleSend}
+        onUploadFile={handleUploadFile}
         onStop={handleStop}
         isRunning={!!pendingTaskId}
         disabled={isSessionArchived}
