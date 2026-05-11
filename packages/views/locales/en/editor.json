@@ -58,5 +58,17 @@
   "mermaid": {
     "render_error": "Unable to render Mermaid diagram.",
     "rendering": "Rendering diagram…"
+  },
+  "conflict_dialog": {
+    "title": "Description was updated",
+    "description": "This description was changed by someone else while you were editing. Choose how to resolve the conflict.",
+    "your_version": "Your version",
+    "their_version": "Their version",
+    "keep_mine": "Keep mine",
+    "use_theirs": "Use theirs",
+    "merge_manually": "Merge manually",
+    "merge_placeholder": "Edit the merged result here…",
+    "save_merge": "Save merge",
+    "cancel": "Cancel"
   }
 }

@@ -58,5 +58,17 @@
   "mermaid": {
     "render_error": "无法渲染 Mermaid 图。",
     "rendering": "渲染中…"
+  },
+  "conflict_dialog": {
+    "title": "描述已被更新",
+    "description": "你正在编辑这条描述时,有其他人也修改了它。选择如何解决冲突。",
+    "your_version": "你的版本",
+    "their_version": "对方的版本",
+    "keep_mine": "用我的",
+    "use_theirs": "用对方的",
+    "merge_manually": "手动合并",
+    "merge_placeholder": "在这里编辑合并后的结果…",
+    "save_merge": "保存合并",
+    "cancel": "取消"
   }
 }

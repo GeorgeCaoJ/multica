@@ -2,7 +2,9 @@ export {
   ContentEditor,
   type ContentEditorProps,
   type ContentEditorRef,
+  type ContentEditorResolution,
 } from "./content-editor";
+export { DescriptionConflictDialog } from "./description-conflict-dialog";
 export {
   TitleEditor,
   type TitleEditorProps,
