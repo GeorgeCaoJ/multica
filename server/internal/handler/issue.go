@@ -1347,6 +1347,11 @@ func (h *Handler) CreateIssue(w http.ResponseWriter, r *http.Request) {
 		if h.shouldEnqueueAgentTask(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
 		}
+		// Squad assigned at creation: trigger the squad leader (skipping
+		// backlog, same parking-lot semantics as agent assignment).
+		if h.shouldEnqueueSquadLeaderOnAssign(r.Context(), issue) {
+			h.enqueueSquadLeaderTask(r.Context(), issue, pgtype.UUID{}, creatorType, actualCreatorID)
+		}
 	}
 
 	writeJSON(w, http.StatusCreated, resp)
@@ -1562,8 +1567,9 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
 		}
 
-		// Squad assign: immediately trigger the squad leader.
-		if issue.AssigneeType.Valid && issue.AssigneeType.String == "squad" && issue.AssigneeID.Valid {
+		// Squad assign: trigger the squad leader, respecting the backlog
+		// parking-lot rule used by agent assignment.
+		if h.shouldEnqueueSquadLeaderOnAssign(r.Context(), issue) {
 			h.enqueueSquadLeaderTask(r.Context(), issue, pgtype.UUID{}, actorType, actorID)
 		}
 	}
@@ -1575,6 +1581,9 @@ func (h *Handler) UpdateIssue(w http.ResponseWriter, r *http.Request) {
 		prevIssue.Status == "backlog" && issue.Status != "done" && issue.Status != "cancelled" {
 		if h.isAgentAssigneeReady(r.Context(), issue) {
 			h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
+		}
+		if h.isSquadLeaderReady(r.Context(), issue) {
+			h.enqueueSquadLeaderTask(r.Context(), issue, pgtype.UUID{}, actorType, actorID)
 		}
 	}
 
@@ -1956,6 +1965,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			if h.shouldEnqueueAgentTask(r.Context(), issue) {
 				h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
 			}
+			if h.shouldEnqueueSquadLeaderOnAssign(r.Context(), issue) {
+				h.enqueueSquadLeaderTask(r.Context(), issue, pgtype.UUID{}, actorType, actorID)
+			}
 		}
 
 		// Trigger agent when moving out of backlog (batch).
@@ -1963,6 +1975,9 @@ func (h *Handler) BatchUpdateIssues(w http.ResponseWriter, r *http.Request) {
 			prevIssue.Status == "backlog" && issue.Status != "done" && issue.Status != "cancelled" {
 			if h.isAgentAssigneeReady(r.Context(), issue) {
 				h.TaskService.EnqueueTaskForIssue(r.Context(), issue)
+			}
+			if h.isSquadLeaderReady(r.Context(), issue) {
+				h.enqueueSquadLeaderTask(r.Context(), issue, pgtype.UUID{}, actorType, actorID)
 			}
 		}
 
