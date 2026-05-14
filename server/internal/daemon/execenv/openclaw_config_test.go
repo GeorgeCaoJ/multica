@@ -1,71 +1,122 @@
 package execenv
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// TestPrepareOpenclawConfigOverridesWorkspace pins that the per-task config
-// writes agents.defaults.workspace = workDir and rewrites every
-// agents.list[].workspace. The upstream scanner resolves
-// `agents.list[id].workspace → agents.defaults.workspace → ~/.openclaw/
-// workspace`, so leaving per-agent workspaces alone would silently bypass
-// the override on agents the user has explicitly configured.
-func TestPrepareOpenclawConfigOverridesWorkspace(t *testing.T) {
-	// Not parallel: mutates HOME / OPENCLAW_CONFIG_PATH.
+// openclawCLIStub captures one or more (subcommand, response) pairs and
+// installs itself into the package-level openclawExec hook for the duration
+// of a test. Each call records the args it saw so assertions can verify the
+// preparer hit `config file` and `config get agents.list --json`.
+type openclawCLIStub struct {
+	t         *testing.T
+	bin       string
+	responses map[string]openclawResponse
+	calls     []openclawCall
+}
+
+type openclawCall struct {
+	bin  string
+	args []string
+}
+
+type openclawResponse struct {
+	stdout string
+	err    error
+}
+
+func installOpenclawStub(t *testing.T, responses map[string]openclawResponse) *openclawCLIStub {
+	t.Helper()
+	stub := &openclawCLIStub{
+		t:         t,
+		bin:       "/test/stub/openclaw",
+		responses: responses,
+	}
+	prev := openclawExec
+	openclawExec = stub.exec
+	t.Cleanup(func() { openclawExec = prev })
+	return stub
+}
+
+func (s *openclawCLIStub) exec(_ context.Context, bin string, args ...string) (string, error) {
+	s.calls = append(s.calls, openclawCall{bin: bin, args: append([]string(nil), args...)})
+	key := strings.Join(args, " ")
+	resp, ok := s.responses[key]
+	if !ok {
+		return "", fmt.Errorf("openclawCLIStub: unexpected args %q", key)
+	}
+	return resp.stdout, resp.err
+}
+
+func mustReadJSON(t *testing.T, path string) map[string]any {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read synthesized cfg: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("parse synthesized cfg: %v", err)
+	}
+	return got
+}
+
+// TestPrepareOpenclawConfigDelegatesParsingToCLI is the headline assertion
+// for the Elon must-fix: instead of re-parsing the user's openclaw.json
+// with encoding/json (which can't read JSON5 / $include / env-var
+// substitution), we delegate the read to the openclaw CLI. The wrapper
+// $includes the user's active path so OpenClaw's own loader handles the
+// JSON5 / $include resolution; we only emit workspace overrides.
+func TestPrepareOpenclawConfigDelegatesParsingToCLI(t *testing.T) {
 	envRoot := t.TempDir()
 	workDir := filepath.Join(envRoot, "workdir")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir workdir: %v", err)
 	}
 
-	// Seed a user config that mimics a real install: defaults.workspace
-	// pointed at the shared ~/.openclaw/workspace AND a per-agent workspace
-	// override that would otherwise win.
-	userHome := t.TempDir()
-	if err := os.MkdirAll(filepath.Join(userHome, ".openclaw"), 0o755); err != nil {
-		t.Fatalf("mkdir user home: %v", err)
-	}
-	userCfg := map[string]any{
-		"agents": map[string]any{
-			"defaults": map[string]any{
-				"workspace": "/Users/alice/.openclaw/workspace",
-				"model": map[string]any{
-					"primary": "deepseek/deepseek-chat",
-				},
-			},
-			"list": []any{
-				map[string]any{
-					"id":        "coding-bot",
-					"workspace": "/Users/alice/projects/coding-bot",
-					"model":     "anthropic/claude-sonnet-4",
-				},
-				map[string]any{
-					"id":    "scout",
-					"model": "openai/gpt-5",
-				},
-			},
-		},
-		"gateway": map[string]any{
-			"port": float64(18789),
-		},
-	}
-	data, err := json.MarshalIndent(userCfg, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal user cfg: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(userHome, ".openclaw", "openclaw.json"), data, 0o600); err != nil {
+	// JSON5 user config — comments and trailing commas would break the old
+	// encoding/json reader. The stub doesn't actually parse this; it just
+	// proves the wrapper points the $include at the right file regardless
+	// of its on-disk syntax.
+	userConfigDir := t.TempDir()
+	userConfigPath := filepath.Join(userConfigDir, "openclaw.json")
+	json5Body := `// User config with JSON5 features the old parser couldn't read
+{
+  agents: {
+    defaults: {
+      workspace: "/Users/alice/.openclaw/workspace",
+      model: { primary: "anthropic/claude-sonnet-4-6" },
+    },
+    list: [
+      { id: "scout", workspace: "/Users/alice/projects/scout", },
+      { id: "coder", model: "openai/gpt-5", },
+    ],
+  },
+  gateway: { port: 18789 }, // trailing comma
+}
+`
+	if err := os.WriteFile(userConfigPath, []byte(json5Body), 0o600); err != nil {
 		t.Fatalf("write user cfg: %v", err)
 	}
 
-	t.Setenv("HOME", userHome)
-	t.Setenv("OPENCLAW_CONFIG_PATH", "") // force the HOME fallback
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file": {stdout: userConfigPath + "\n"},
+		"config get agents.list --json": {stdout: `[
+			{ "id": "scout", "workspace": "/Users/alice/projects/scout" },
+			{ "id": "coder", "model": "openai/gpt-5" }
+		]`},
+	})
 
-	cfgPath, err := prepareOpenclawConfig(envRoot, workDir)
+	cfgPath, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
 	if err != nil {
 		t.Fatalf("prepareOpenclawConfig: %v", err)
 	}
@@ -73,13 +124,13 @@ func TestPrepareOpenclawConfigOverridesWorkspace(t *testing.T) {
 		t.Errorf("cfgPath = %q, want %q", cfgPath, filepath.Join(envRoot, openclawConfigFile))
 	}
 
-	raw, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatalf("read synthesized cfg: %v", err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("parse synthesized cfg: %v", err)
+	got := mustReadJSON(t, cfgPath)
+
+	// $include must reference the user's active config so OpenClaw's own
+	// loader does the JSON5 / $include / env-substitution work.
+	include, ok := got["$include"].([]any)
+	if !ok || len(include) != 1 || include[0] != userConfigPath {
+		t.Errorf("$include = %v, want [%q]", got["$include"], userConfigPath)
 	}
 
 	agents := got["agents"].(map[string]any)
@@ -88,12 +139,9 @@ func TestPrepareOpenclawConfigOverridesWorkspace(t *testing.T) {
 		t.Errorf("agents.defaults.workspace = %v, want %q", defaults["workspace"], workDir)
 	}
 
-	// User's other defaults fields (model, etc.) must survive the override.
-	model, ok := defaults["model"].(map[string]any)
-	if !ok || model["primary"] != "deepseek/deepseek-chat" {
-		t.Errorf("agents.defaults.model not preserved: %v", defaults["model"])
-	}
-
+	// Per-agent workspaces must be rewritten so a host-scope agents.list[].
+	// workspace cannot silently win over our defaults override. This is
+	// intentional per-task isolation (see prepareOpenclawConfig doc).
 	list := agents["list"].([]any)
 	if len(list) != 2 {
 		t.Fatalf("agents.list length = %d, want 2", len(list))
@@ -104,99 +152,175 @@ func TestPrepareOpenclawConfigOverridesWorkspace(t *testing.T) {
 			t.Errorf("agents.list[%d].workspace = %v, want %q (per-agent overrides must be rewritten so they don't beat defaults)", i, entry["workspace"], workDir)
 		}
 	}
-
-	// Non-agents top-level fields must survive (gateway, models, providers).
-	gw, ok := got["gateway"].(map[string]any)
-	if !ok || gw["port"].(float64) != 18789 {
-		t.Errorf("gateway section not preserved: %v", got["gateway"])
+	// Non-workspace fields per entry are carried over so a sibling-replace
+	// merge in OpenClaw's $include semantics doesn't silently lose them.
+	if list[0].(map[string]any)["id"] != "scout" {
+		t.Errorf("agents.list[0].id lost in carryover: %v", list[0])
+	}
+	if list[1].(map[string]any)["model"] != "openai/gpt-5" {
+		t.Errorf("agents.list[1].model lost in carryover: %v", list[1])
 	}
 }
 
-// TestPrepareOpenclawConfigMissingUserConfig — a fresh openclaw install with
-// no ~/.openclaw/openclaw.json must not break task startup. We synthesize a
-// minimal config containing just the workspace override so the scanner at
-// least picks up {workDir}/skills/.
-func TestPrepareOpenclawConfigMissingUserConfig(t *testing.T) {
+// TestPrepareOpenclawConfigFailsClosedOnCLIError — the headline regression
+// for Elon's review. When the openclaw CLI fails (broken config, missing
+// binary, etc.), prepareOpenclawConfig MUST surface the error rather than
+// silently synthesize a minimal config that would mask the user's broken
+// state and boot OpenClaw without their registered agents.
+func TestPrepareOpenclawConfigFailsClosedOnCLIError(t *testing.T) {
 	envRoot := t.TempDir()
 	workDir := filepath.Join(envRoot, "workdir")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir workdir: %v", err)
 	}
 
-	emptyHome := t.TempDir()
-	t.Setenv("HOME", emptyHome)
-	t.Setenv("OPENCLAW_CONFIG_PATH", "")
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file": {err: errors.New("exec: openclaw: no such file or directory")},
+	})
 
-	cfgPath, err := prepareOpenclawConfig(envRoot, workDir)
-	if err != nil {
-		t.Fatalf("prepareOpenclawConfig: %v", err)
+	_, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
+	if err == nil {
+		t.Fatal("prepareOpenclawConfig succeeded on CLI failure; expected fail closed")
+	}
+	if !strings.Contains(err.Error(), "locate openclaw active config") {
+		t.Errorf("error message %q does not name the failed step", err.Error())
 	}
 
-	raw, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatalf("read synthesized cfg: %v", err)
-	}
-	var got map[string]any
-	if err := json.Unmarshal(raw, &got); err != nil {
-		t.Fatalf("parse synthesized cfg: %v", err)
-	}
-	agents := got["agents"].(map[string]any)
-	defaults := agents["defaults"].(map[string]any)
-	if defaults["workspace"] != workDir {
-		t.Errorf("agents.defaults.workspace = %v, want %q", defaults["workspace"], workDir)
+	// No stale wrapper left behind.
+	if _, err := os.Stat(filepath.Join(envRoot, openclawConfigFile)); !os.IsNotExist(err) {
+		t.Errorf("wrapper config should not exist after fail-closed; got err = %v", err)
 	}
 }
 
-// TestPrepareOpenclawConfigFollowsEnvVar — when $OPENCLAW_CONFIG_PATH is
-// already set on the daemon's environment (e.g. wrapping another tool that
-// redirected openclaw at a custom file), the preparer reads from that path
-// rather than ~/.openclaw/openclaw.json. The per-task synthesized copy then
-// inherits everything from the redirected source.
-func TestPrepareOpenclawConfigFollowsEnvVar(t *testing.T) {
+// TestPrepareOpenclawConfigFailsClosedOnMalformedAgentsList — the second
+// fail-closed surface. When `openclaw config get agents.list --json`
+// returns junk we can't parse, we fail rather than guess.
+func TestPrepareOpenclawConfigFailsClosedOnMalformedAgentsList(t *testing.T) {
 	envRoot := t.TempDir()
 	workDir := filepath.Join(envRoot, "workdir")
 	if err := os.MkdirAll(workDir, 0o755); err != nil {
 		t.Fatalf("mkdir workdir: %v", err)
 	}
 
-	srcDir := t.TempDir()
-	srcPath := filepath.Join(srcDir, "alt-openclaw.json")
-	srcCfg := map[string]any{
-		"agents": map[string]any{
-			"defaults": map[string]any{
-				"workspace": "/should/be/overwritten",
-			},
-		},
-		"meta": map[string]any{
-			"marker": "from-env-var-source",
-		},
-	}
-	data, err := json.MarshalIndent(srcCfg, "", "  ")
-	if err != nil {
-		t.Fatalf("marshal src cfg: %v", err)
-	}
-	if err := os.WriteFile(srcPath, data, 0o600); err != nil {
-		t.Fatalf("write src cfg: %v", err)
+	userConfigPath := filepath.Join(t.TempDir(), "openclaw.json")
+	if err := os.WriteFile(userConfigPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write user cfg: %v", err)
 	}
 
-	t.Setenv("OPENCLAW_CONFIG_PATH", srcPath)
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file":                   {stdout: userConfigPath},
+		"config get agents.list --json": {stdout: "<<<garbage>>>"},
+	})
 
-	cfgPath, err := prepareOpenclawConfig(envRoot, workDir)
+	_, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
+	if err == nil {
+		t.Fatal("prepareOpenclawConfig succeeded on malformed agents.list output; expected fail closed")
+	}
+	if !strings.Contains(err.Error(), "agents.list") {
+		t.Errorf("error message %q does not name the failed step", err.Error())
+	}
+}
+
+// TestPrepareOpenclawConfigKeyMissingTreatedAsEmpty — `config get` exits
+// non-zero when a path is unset. That is not a failure; the user simply has
+// no agents.list. We must produce a valid wrapper with just the defaults
+// override.
+func TestPrepareOpenclawConfigKeyMissingTreatedAsEmpty(t *testing.T) {
+	envRoot := t.TempDir()
+	workDir := filepath.Join(envRoot, "workdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workdir: %v", err)
+	}
+
+	userConfigPath := filepath.Join(t.TempDir(), "openclaw.json")
+	if err := os.WriteFile(userConfigPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write user cfg: %v", err)
+	}
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file":                   {stdout: userConfigPath},
+		"config get agents.list --json": {err: errors.New("openclaw: No value at agents.list")},
+	})
+
+	cfgPath, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
 	if err != nil {
 		t.Fatalf("prepareOpenclawConfig: %v", err)
 	}
-	raw, _ := os.ReadFile(cfgPath)
-	var got map[string]any
-	_ = json.Unmarshal(raw, &got)
-
-	meta := got["meta"].(map[string]any)
-	if meta["marker"] != "from-env-var-source" {
-		t.Errorf("synthesized cfg should inherit from $OPENCLAW_CONFIG_PATH source; got meta = %v", meta)
+	got := mustReadJSON(t, cfgPath)
+	if _, present := got["agents"].(map[string]any)["list"]; present {
+		t.Errorf("agents.list should be omitted when user has none, got %v", got["agents"])
 	}
-	agents := got["agents"].(map[string]any)
-	defaults := agents["defaults"].(map[string]any)
-	if defaults["workspace"] != workDir {
-		t.Errorf("workspace = %v, want %q (override must replace the source's value)", defaults["workspace"], workDir)
+	if got["agents"].(map[string]any)["defaults"].(map[string]any)["workspace"] != workDir {
+		t.Errorf("defaults.workspace not set when agents.list missing")
+	}
+}
+
+// TestPrepareOpenclawConfigFreshInstallNoOnDiskConfig — the only legitimate
+// "synthesize minimal" case. `openclaw config file` reports a path (the
+// default) but the file does not exist yet. We emit a wrapper with the
+// workspace override and NO $include (there is nothing to include).
+func TestPrepareOpenclawConfigFreshInstallNoOnDiskConfig(t *testing.T) {
+	envRoot := t.TempDir()
+	workDir := filepath.Join(envRoot, "workdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workdir: %v", err)
+	}
+
+	// CLI reports a default path that doesn't exist (fresh install).
+	missingPath := filepath.Join(t.TempDir(), "openclaw.json")
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file": {stdout: missingPath},
+		// `config get` should not be called when the file does not exist;
+		// the stub will fail "unexpected args" if it is.
+	})
+
+	cfgPath, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
+	if err != nil {
+		t.Fatalf("prepareOpenclawConfig: %v", err)
+	}
+	got := mustReadJSON(t, cfgPath)
+	if _, present := got["$include"]; present {
+		t.Errorf("$include should be absent for fresh install, got %v", got["$include"])
+	}
+	if got["agents"].(map[string]any)["defaults"].(map[string]any)["workspace"] != workDir {
+		t.Errorf("defaults.workspace not set on fresh-install wrapper")
+	}
+}
+
+// TestPrepareOpenclawConfigExpandsTilde — `openclaw config file` reports
+// paths with `~` shortened. The $include in our wrapper must be absolute so
+// the loader resolves it unambiguously.
+func TestPrepareOpenclawConfigExpandsTilde(t *testing.T) {
+	envRoot := t.TempDir()
+	workDir := filepath.Join(envRoot, "workdir")
+	if err := os.MkdirAll(workDir, 0o755); err != nil {
+		t.Fatalf("mkdir workdir: %v", err)
+	}
+
+	fakeHome := t.TempDir()
+	t.Setenv("HOME", fakeHome)
+	if err := os.MkdirAll(filepath.Join(fakeHome, ".openclaw"), 0o755); err != nil {
+		t.Fatalf("mkdir home/.openclaw: %v", err)
+	}
+	realPath := filepath.Join(fakeHome, ".openclaw", "openclaw.json")
+	if err := os.WriteFile(realPath, []byte(`{}`), 0o600); err != nil {
+		t.Fatalf("write user cfg: %v", err)
+	}
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file":                   {stdout: "~/.openclaw/openclaw.json\n"},
+		"config get agents.list --json": {stdout: "null"},
+	})
+
+	cfgPath, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
+	if err != nil {
+		t.Fatalf("prepareOpenclawConfig: %v", err)
+	}
+	got := mustReadJSON(t, cfgPath)
+	include := got["$include"].([]any)
+	if include[0] != realPath {
+		t.Errorf("$include[0] = %v, want %q (tilde must be expanded to absolute)", include[0], realPath)
 	}
 }
 
@@ -206,7 +330,7 @@ func TestPrepareOpenclawConfigFollowsEnvVar(t *testing.T) {
 // resolving the workspaceDir the way OpenClaw does (agents.defaults.workspace
 // from the synthesized config) and proving {workspaceDir}/skills/ holds the
 // skill we wrote. Previous fixes asserted "we wrote a file" without checking
-// the scanner would ever see it; that's why MUL-2213 / #2621 needed a
+// the scanner would ever see it; that is why MUL-2213 / #2621 needed a
 // follow-up.
 func TestPrepareOpenclawSkillWriteMatchesScanPath(t *testing.T) {
 	envRoot := t.TempDir()
@@ -216,15 +340,19 @@ func TestPrepareOpenclawSkillWriteMatchesScanPath(t *testing.T) {
 			t.Fatalf("mkdir %s: %v", sub, err)
 		}
 	}
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("OPENCLAW_CONFIG_PATH", "")
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		// Fresh install — no user config on disk. Wrapper carries only the
+		// workspace override, which is what the scanner reads.
+		"config file": {stdout: filepath.Join(t.TempDir(), "absent-openclaw.json")},
+	})
 
 	skills := []SkillContextForEnv{
 		{Name: "Issue Review", Content: "Review issues thoroughly."},
 		{Name: "Local Dev", Content: "Spin up the local dev env."},
 	}
 
-	cfgPath, err := prepareOpenclawConfig(envRoot, workDir)
+	cfgPath, err := prepareOpenclawConfig(envRoot, workDir, OpenclawConfigPrep{OpenclawBin: stub.bin})
 	if err != nil {
 		t.Fatalf("prepareOpenclawConfig: %v", err)
 	}
@@ -235,17 +363,8 @@ func TestPrepareOpenclawSkillWriteMatchesScanPath(t *testing.T) {
 		t.Fatalf("writeContextFiles: %v", err)
 	}
 
-	raw, err := os.ReadFile(cfgPath)
-	if err != nil {
-		t.Fatalf("read synthesized cfg: %v", err)
-	}
-	var cfg map[string]any
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		t.Fatalf("parse synthesized cfg: %v", err)
-	}
+	cfg := mustReadJSON(t, cfgPath)
 	wsDir := cfg["agents"].(map[string]any)["defaults"].(map[string]any)["workspace"].(string)
-
-	// Scan path #1 the openclaw runtime would inspect: <workspaceDir>/skills/
 	for _, s := range skills {
 		want := filepath.Join(wsDir, "skills", sanitizeSkillName(s.Name), "SKILL.md")
 		if _, err := os.Stat(want); err != nil {
@@ -256,11 +375,15 @@ func TestPrepareOpenclawSkillWriteMatchesScanPath(t *testing.T) {
 
 // TestPrepareEnvironmentOpenclawWiresConfigPath — end-to-end: Prepare sets
 // env.OpenclawConfigPath so the daemon can export OPENCLAW_CONFIG_PATH, and
-// the path resolves to a file with the correct workspace override.
+// the path resolves to a file with the correct workspace override. With
+// fail-closed semantics, Prepare itself errors when the CLI is unavailable;
+// a stub here keeps the happy path observable.
 func TestPrepareEnvironmentOpenclawWiresConfigPath(t *testing.T) {
 	wsRoot := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("OPENCLAW_CONFIG_PATH", "")
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file": {stdout: filepath.Join(t.TempDir(), "absent.json")},
+	})
 
 	env, err := Prepare(PrepareParams{
 		WorkspacesRoot: wsRoot,
@@ -268,6 +391,7 @@ func TestPrepareEnvironmentOpenclawWiresConfigPath(t *testing.T) {
 		TaskID:         "11111111-2222-3333-4444-555555555555",
 		AgentName:      "scout",
 		Provider:       "openclaw",
+		OpenclawBin:    stub.bin,
 		Task: TaskContextForEnv{
 			IssueID: "issue-1",
 		},
@@ -278,25 +402,49 @@ func TestPrepareEnvironmentOpenclawWiresConfigPath(t *testing.T) {
 	if env.OpenclawConfigPath == "" {
 		t.Fatal("Prepare(openclaw) did not set OpenclawConfigPath")
 	}
-	if _, err := os.Stat(env.OpenclawConfigPath); err != nil {
-		t.Fatalf("OpenclawConfigPath does not exist: %v", err)
+	got := mustReadJSON(t, env.OpenclawConfigPath)
+	workspace := got["agents"].(map[string]any)["defaults"].(map[string]any)["workspace"]
+	if workspace != env.WorkDir {
+		t.Errorf("agents.defaults.workspace = %v, want %q", workspace, env.WorkDir)
 	}
-	raw, _ := os.ReadFile(env.OpenclawConfigPath)
-	var cfg map[string]any
-	_ = json.Unmarshal(raw, &cfg)
-	got := cfg["agents"].(map[string]any)["defaults"].(map[string]any)["workspace"]
-	if got != env.WorkDir {
-		t.Errorf("agents.defaults.workspace = %v, want %q", got, env.WorkDir)
+}
+
+// TestPrepareEnvironmentOpenclawFailsClosed — when the openclaw CLI errors
+// during Prepare, the whole call must fail. Previously the preparer logged
+// a warning and continued with no config; we have removed that path.
+func TestPrepareEnvironmentOpenclawFailsClosed(t *testing.T) {
+	wsRoot := t.TempDir()
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{
+		"config file": {err: errors.New("openclaw config validation failed")},
+	})
+
+	_, err := Prepare(PrepareParams{
+		WorkspacesRoot: wsRoot,
+		WorkspaceID:    "ws-1",
+		TaskID:         "22222222-2222-3333-4444-555555555555",
+		AgentName:      "scout",
+		Provider:       "openclaw",
+		OpenclawBin:    stub.bin,
+		Task:           TaskContextForEnv{IssueID: "issue-1"},
+	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err == nil {
+		t.Fatal("Prepare(openclaw) succeeded when CLI errored; expected fail closed")
+	}
+	if !strings.Contains(err.Error(), "prepare openclaw config") {
+		t.Errorf("error message %q does not name the openclaw config step", err.Error())
 	}
 }
 
 // TestPrepareEnvironmentNonOpenclawSkipsConfig — non-openclaw providers
 // must not get a synthesized openclaw config (it would be dead weight on
-// disk and confuse the GC reaper's idea of what an env contains).
+// disk and confuse the GC reaper's idea of what an env contains). They
+// also must NOT shell out to the openclaw CLI, so the stub here records
+// zero calls.
 func TestPrepareEnvironmentNonOpenclawSkipsConfig(t *testing.T) {
 	wsRoot := t.TempDir()
-	t.Setenv("HOME", t.TempDir())
-	t.Setenv("OPENCLAW_CONFIG_PATH", "")
+
+	stub := installOpenclawStub(t, map[string]openclawResponse{})
 
 	taskIDs := map[string]string{
 		"claude":   "aaaaaaaa-1111-2222-3333-444444444444",
@@ -324,5 +472,8 @@ func TestPrepareEnvironmentNonOpenclawSkipsConfig(t *testing.T) {
 				t.Errorf("provider %s left a stray openclaw-config.json", provider)
 			}
 		})
+	}
+	if len(stub.calls) != 0 {
+		t.Errorf("non-openclaw providers shelled out to openclaw CLI %d times: %+v", len(stub.calls), stub.calls)
 	}
 }

@@ -2065,8 +2065,18 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	// Try to reuse the workdir from a previous task on the same (agent, issue) pair.
 	var env *execenv.Environment
 	codexVersion := d.agentVersion("codex")
+	openclawBin := ""
+	if provider == "openclaw" {
+		openclawBin = entry.Path
+	}
 	if task.PriorWorkDir != "" {
-		env = execenv.Reuse(task.PriorWorkDir, provider, codexVersion, taskCtx, d.logger)
+		env = execenv.Reuse(execenv.ReuseParams{
+			WorkDir:      task.PriorWorkDir,
+			Provider:     provider,
+			CodexVersion: codexVersion,
+			OpenclawBin:  openclawBin,
+			Task:         taskCtx,
+		}, d.logger)
 	}
 	if env == nil {
 		var err error
@@ -2077,6 +2087,7 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 			AgentName:      agentName,
 			Provider:       provider,
 			CodexVersion:   codexVersion,
+			OpenclawBin:    openclawBin,
 			Task:           taskCtx,
 		}, d.logger)
 		if err != nil {
@@ -2221,8 +2232,12 @@ func (d *Daemon) runTask(ctx context.Context, task Task, provider string, slot i
 	}
 	// Some providers do not reliably load the per-task runtime config files we
 	// write into the task workdir:
-	//   - openclaw loads bootstrap files (AGENTS.md, SOUL.md, ...) from its own
-	//     workspace dir rather than the task workdir.
+	//   - openclaw is pinned to the task workdir via the per-task config we
+	//     synthesize (see prepareOpenclawConfig), so AGENTS.md / .agent_context/
+	//     in the workdir ARE picked up by the CLI. Inline injection is retained
+	//     as a belt-and-suspenders for older openclaw releases until that load
+	//     path stabilises in production; remove this once a release tracks the
+	//     workdir bootstrap reliably end-to-end.
 	//   - kiro and kimi are wrapped through their own CLIs whose cwd handling
 	//     is opaque enough that we can't trust the file-based path either.
 	// Pass the full runtime brief inline (CLI catalog + workflow steps + agent
