@@ -77,17 +77,17 @@ export function CreateSquadModal({ onClose }: { onClose: () => void }) {
   const [selectedMembers, setSelectedMembers] = useState<SelectedMember[]>([]);
   const [creating, setCreating] = useState(false);
 
-  // Promoting an agent to leader must actually drop it from selectedMembers,
-  // not merely hide it. Otherwise switching leader away later resurrects the
-  // hidden pick and silently submits it as a member.
-  const handleLeaderChange = (id: string) => {
-    setLeaderId(id);
-    if (id) {
-      setSelectedMembers((prev) =>
-        prev.filter((m) => !(m.type === "agent" && m.id === id)),
-      );
-    }
-  };
+  // Treat leader as a filter over selectedMembers, not a destructive mutation.
+  // If the user adds Bob, promotes Bob to leader, then switches leader to
+  // Alice, Bob must reappear as an additional member (and be POSTed). Dropping
+  // Bob from selectedMembers at promotion time loses that intent permanently.
+  const membersToSubmit = useMemo(
+    () =>
+      selectedMembers.filter(
+        (m) => !(m.type === "agent" && m.id === leaderId),
+      ),
+    [selectedMembers, leaderId],
+  );
 
   const canSubmit = !!name.trim() && !!leaderId && !creating;
 
@@ -103,9 +103,9 @@ export function CreateSquadModal({ onClose }: { onClose: () => void }) {
       });
       queryClient.invalidateQueries({ queryKey: workspaceKeys.squads(wsId) });
 
-      if (selectedMembers.length > 0) {
+      if (membersToSubmit.length > 0) {
         await Promise.allSettled(
-          selectedMembers.map(async (m) => {
+          membersToSubmit.map(async (m) => {
             try {
               await api.addSquadMember(squad.id, {
                 member_type: m.type,
@@ -203,7 +203,7 @@ export function CreateSquadModal({ onClose }: { onClose: () => void }) {
               agents={activeAgents}
               currentUserId={currentUserId}
               value={leaderId}
-              onChange={handleLeaderChange}
+              onChange={setLeaderId}
             />
 
             <AdditionalMembersPicker
@@ -447,6 +447,13 @@ function AdditionalMembersPicker({
   const anyResults =
     filteredMine.length + filteredOthers.length + filteredMembers.length > 0;
 
+  // Treat the current leader as a chip-render filter: if Bob is in `value`
+  // (the user selected him as an additional member) and is now also the leader,
+  // hide his chip. When leader changes away, Bob reappears automatically.
+  const visibleChips = value.filter(
+    (m) => !(m.type === "agent" && m.id === leaderId),
+  );
+
   return (
     <div>
       <Label className="text-xs text-muted-foreground">
@@ -468,17 +475,29 @@ function AdditionalMembersPicker({
       >
         {/* render={<div role="combobox" />} — chips contain their own remove
             <button>, so the trigger cannot itself be a <button> without
-            nesting interactive content. Base UI injects click/keyboard/ARIA
-            wiring into the rendered element. */}
+            nesting interactive content. nativeButton={false} is required so
+            Base UI applies non-native keyboard semantics (Enter/Space-to-open
+            via useButton) instead of warning about non-<button> render and
+            silently dropping keyboard activation. ArrowDown-to-open follows
+            the WAI-ARIA combobox pattern and is wired explicitly because
+            useButton only handles Enter/Space. */}
         <PopoverTrigger
+          nativeButton={false}
           render={
             <div
               role="combobox"
               aria-haspopup="listbox"
+              aria-expanded={open}
               tabIndex={0}
+              onKeyDown={(e) => {
+                if (e.key === "ArrowDown" && !open) {
+                  e.preventDefault();
+                  setOpen(true);
+                }
+              }}
               className="flex w-full min-w-0 cursor-pointer items-center gap-3 rounded-lg border border-border bg-background px-3 py-2.5 text-left text-sm transition-colors hover:bg-muted focus:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
             >
-              {value.length === 0 ? (
+              {visibleChips.length === 0 ? (
                 <>
                   <UserPlus className="h-4 w-4 shrink-0 text-muted-foreground" />
                   <span className="min-w-0 flex-1 truncate text-muted-foreground">
@@ -487,17 +506,17 @@ function AdditionalMembersPicker({
                 </>
               ) : (
                 <div className="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
-                  {value.slice(0, CHIP_DISPLAY_LIMIT).map((m) => (
+                  {visibleChips.slice(0, CHIP_DISPLAY_LIMIT).map((m) => (
                     <MemberChip
                       key={`${m.type}:${m.id}`}
                       m={m}
                       onRemove={() => remove(m)}
                     />
                   ))}
-                  {value.length > CHIP_DISPLAY_LIMIT && (
+                  {visibleChips.length > CHIP_DISPLAY_LIMIT && (
                     <span className="rounded-md bg-muted px-1.5 py-0.5 text-xs font-medium text-muted-foreground tabular-nums">
                       {t(($) => $.create_squad.members_more_count, {
-                        count: value.length - CHIP_DISPLAY_LIMIT,
+                        count: visibleChips.length - CHIP_DISPLAY_LIMIT,
                       })}
                     </span>
                   )}

@@ -360,7 +360,7 @@ describe("CreateSquadModal", () => {
     expect(mocks.addSquadMember).not.toHaveBeenCalled();
   });
 
-  it("removes a member promoted to leader from selectedMembers so switching leader away does not resurrect it", async () => {
+  it("restores a member previously promoted to leader when leader switches away — chip reappears and POST /members runs", async () => {
     renderModal();
     // 1. Add MineAgentTwo as an additional member.
     fireEvent.click(lastMatch("MineAgentTwo"));
@@ -368,18 +368,27 @@ describe("CreateSquadModal", () => {
       expect(screen.getAllByText("MineAgentTwo").length).toBeGreaterThanOrEqual(2);
     });
 
-    // 2. Promote MineAgentTwo to leader (first occurrence is the leader picker row).
+    // 2. Promote MineAgentTwo to leader. With Two as leader the additional-
+    //    members picker hides Two from its list (a.id !== leaderId) AND the
+    //    chip for Two is filtered from the trigger. Two should now appear
+    //    only in the leader picker (its selected-name display + its list
+    //    row) — exactly twice.
     fireEvent.click(firstMatch("MineAgentTwo"));
+    await waitFor(() => {
+      expect(screen.getAllByText("MineAgentTwo").length).toBe(2);
+    });
 
-    // 3. Switch leader back to MineAgentOne. With MineAgentTwo now the leader,
-    //    the additional-members picker filters it out, so MineAgentOne only
-    //    appears twice (leader picker + members picker) and firstMatch hits
-    //    the leader picker row.
+    // 3. Switch leader to MineAgentOne. Because the leader is now One, the
+    //    Two entry that was hidden by the leader-filter must reappear as a
+    //    chip — and submission must include it as a POST /members call.
     fireEvent.click(firstMatch("MineAgentOne"));
+    await waitFor(() => {
+      // Two now appears in: leader picker row + additional members picker row + chip = 3.
+      expect(screen.getAllByText("MineAgentTwo").length).toBeGreaterThanOrEqual(3);
+    });
 
-    // 4. Submit and assert MineAgentTwo is NOT submitted as a member — the
-    //    promotion must have permanently dropped it from selectedMembers.
     mocks.createSquad.mockResolvedValue(makeSquad({ id: "sq-3", leader_id: "agent-mine-1" }));
+    mocks.addSquadMember.mockResolvedValue({});
     fireEvent.change(screen.getByPlaceholderText(/e\.g\. Frontend Team/i), {
       target: { value: "Swap Squad" },
     });
@@ -393,7 +402,13 @@ describe("CreateSquadModal", () => {
         avatar_url: undefined,
       });
     });
-    expect(mocks.addSquadMember).not.toHaveBeenCalled();
+    await waitFor(() => {
+      expect(mocks.addSquadMember).toHaveBeenCalledTimes(1);
+    });
+    expect(mocks.addSquadMember).toHaveBeenCalledWith("sq-3", {
+      member_type: "agent",
+      member_id: "agent-mine-2",
+    });
   });
 
   it("on success with no additional members fires exactly one success toast and navigates", async () => {
