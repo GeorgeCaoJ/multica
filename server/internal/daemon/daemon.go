@@ -201,10 +201,13 @@ func New(cfg Config, logger *slog.Logger) *Daemon {
 	return d
 }
 
-// sendWSFrame pushes a raw frame onto the current daemonws writer queue.
-// Returns false when no connection is active or the writer queue is
-// saturated — callers (today: terminalBridge) drop the frame rather than
-// block, because the next reconnect or queue drain will unstick us.
+// sendWSFrame pushes a raw frame onto the current daemonws writer queue
+// without blocking. Returns false when no connection is active or the
+// writer queue is saturated. Used for *droppable* traffic (currently the
+// heartbeat sender's fallback path): bytes lost here are recoverable on
+// the next tick. PTY output must NOT use this path — it goes through
+// sendWSFrameCtx so a saturated writer back-pressures the producer
+// instead of corrupting the terminal stream.
 func (d *Daemon) sendWSFrame(frame []byte) bool {
 	d.wsWritesMu.RLock()
 	writes := d.wsWrites
@@ -220,6 +223,34 @@ func (d *Daemon) sendWSFrame(frame []byte) bool {
 	}
 }
 
+// sendWSFrameCtx pushes a frame onto the daemonws writer queue and BLOCKS
+// until either the queue accepts it or ctx is canceled. Returns true when
+// the frame was queued, false when no writer is active or ctx fired first.
+//
+// This is the real-backpressure path for the terminal bridge: when the
+// hub is saturated, slowing the PTY reader down (which slows the child
+// process via its own stdout buffer) is the only way to preserve the byte
+// stream. Dropping silently would print partial output to the user.
+//
+// Safety: the caller's ctx is the terminal pump's ctx, which the bridge
+// teardown (clearWSWrites → bridge.closeAll) cancels and *waits on* before
+// close(writes) runs in the wakeup loop. That ordering means we never send
+// on a closed channel even though we don't hold any lock around the send.
+func (d *Daemon) sendWSFrameCtx(ctx context.Context, frame []byte) bool {
+	d.wsWritesMu.RLock()
+	writes := d.wsWrites
+	d.wsWritesMu.RUnlock()
+	if writes == nil {
+		return false
+	}
+	select {
+	case writes <- frame:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
 // installWSWrites stores the connection-local writer queue so the bridge
 // can address it through Daemon.sendWSFrame. A fresh terminalBridge is
 // installed each call: session_ids minted on a previous WS connection are
@@ -231,7 +262,7 @@ func (d *Daemon) installWSWrites(writes chan<- []byte) {
 	d.wsWrites = writes
 	d.wsWritesMu.Unlock()
 
-	bridge := newTerminalBridge(d.terminalManager, d.logger, d.sendWSFrame)
+	bridge := newTerminalBridge(d.terminalManager, d.logger, d.sendWSFrame, d.sendWSFrameCtx)
 	d.terminalBridgeMu.Lock()
 	prev := d.terminalBridge
 	d.terminalBridge = bridge

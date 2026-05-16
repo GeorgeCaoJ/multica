@@ -77,6 +77,13 @@ func SetAllowedOrigins(origins []string) {
 	allowedWSOrigins.Store(origins)
 }
 
+// CheckOrigin is the WebSocket origin check shared by every authenticated
+// realtime endpoint (including the issue terminal proxy). Browser endpoints
+// must NOT install their own `CheckOrigin: true` upgrader — that bypasses
+// CSWSH defense; route through this function instead so the allowlist stays
+// the single source of truth.
+func CheckOrigin(r *http.Request) bool { return checkOrigin(r) }
+
 func checkOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")
 	if origin == "" {

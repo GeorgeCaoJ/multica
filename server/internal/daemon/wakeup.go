@@ -117,11 +117,10 @@ func (d *Daemon) runTaskWakeupConnection(ctx context.Context, runtimeIDs []strin
 	go d.runWSWriter(conn, writes, writerDone)
 
 	// Expose this connection's writer to the terminal bridge so it can push
-	// terminal.* frames back to the server. The defer in the parent cleanup
-	// block clears the pointer (and tears any live PTYs down) before the
-	// writes channel is closed.
+	// terminal.* frames back to the server. The single cleanup defer below
+	// clears the pointer (and tears any live PTYs down) BEFORE the writes
+	// channel is closed, so terminal pumps cannot panic on a closed send.
 	d.installWSWrites(writes)
-	defer d.clearWSWrites()
 
 	heartbeatCtx, cancelHeartbeat := context.WithCancel(ctx)
 	hbDone := make(chan struct{})
@@ -135,19 +134,26 @@ func (d *Daemon) runTaskWakeupConnection(ctx context.Context, runtimeIDs []strin
 		errCh <- d.readTaskWakeupMessages(conn, taskWakeups)
 	}()
 
-	// Defer cleanup must shut goroutines down in this order:
-	//   1. cancel the heartbeat sender's ctx
-	//   2. wait for the sender to actually return — only then is it safe
-	//      to close the writes channel without a "send on closed channel"
-	//      panic from sendWSHeartbeats
-	//   3. close writes; the writer drains and exits
-	//   4. wait for the writer to finish so it doesn't outlive the conn
+	// Teardown ordering is load-bearing — every step here has a producer
+	// that would panic on a closed `writes` channel if reordered:
 	//
-	// LIFO defer order would close writes before the sender stops, so the
-	// teardown is folded into a single deferred function instead.
+	//   1. cancel the heartbeat sender's ctx and wait for it to return.
+	//      Heartbeats are the only droppable producer; once the sender
+	//      has exited it can no longer reach the writes channel.
+	//   2. clearWSWrites: nil the pointer (new sendWSFrame calls bounce)
+	//      AND tear down the terminal bridge. closeAll blocks until every
+	//      pump goroutine has exited — that's the barrier the terminal
+	//      pumps need before we close the channel they share.
+	//   3. close(writes): only safe now that no producer remains.
+	//   4. wait for the writer goroutine to drain & exit so it doesn't
+	//      outlive the conn.
+	//
+	// Two separate defers would run LIFO and reverse 2↔3, which is the
+	// exact race Phase 2 review caught.
 	defer func() {
 		cancelHeartbeat()
 		<-hbDone
+		d.clearWSWrites()
 		close(writes)
 		<-writerDone
 	}()

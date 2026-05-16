@@ -17,6 +17,7 @@ import (
 
 	"github.com/multica-ai/multica/server/internal/auth"
 	"github.com/multica-ai/multica/server/internal/daemonws"
+	"github.com/multica-ai/multica/server/internal/realtime"
 	"github.com/multica-ai/multica/server/internal/util"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 	"github.com/multica-ai/multica/server/pkg/protocol"
@@ -34,12 +35,13 @@ const terminalWriteWait = 10 * time.Second
 // 5s is generous: PTY spawn is local and synchronous on the daemon side.
 const terminalOpenTimeout = 5 * time.Second
 
+// terminalUpgrader reuses the realtime hub's origin allowlist. The terminal
+// endpoint executes a shell on the daemon, so it must be at least as strict
+// about cross-origin connections as the read-only realtime WS — using the
+// shared CheckOrigin keeps the policy in one place and prevents an
+// accidentally permissive `CheckOrigin: true` from sneaking past review.
 var terminalUpgrader = websocket.Upgrader{
-	// Browser cookie auth has already happened by the time we get here;
-	// cross-site cookie attacks are mitigated by SameSite=Lax on the auth
-	// cookie itself (see auth.SetAuthCookie). Re-evaluate if we ever
-	// support Authorization-header auth on this endpoint.
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: realtime.CheckOrigin,
 }
 
 // HandleIssueTerminalWS proxies a browser WebSocket onto a PTY running on

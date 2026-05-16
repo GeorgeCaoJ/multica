@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"log/slog"
@@ -27,6 +28,16 @@ func (c *captureSender) send(frame []byte) bool {
 	copy(cp, frame)
 	c.frames = append(c.frames, cp)
 	return true
+}
+
+// sendCtx is the backpressure-aware delivery path the terminal bridge uses
+// for terminal.data. Tests that don't care about backpressure can use this
+// default — it accepts every frame the same way send() does.
+func (c *captureSender) sendCtx(ctx context.Context, frame []byte) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	return c.send(frame)
 }
 
 func (c *captureSender) waitFor(t *testing.T, msgType string, timeout time.Duration) protocol.Message {
@@ -131,7 +142,7 @@ func TestTerminalBridge_OpenSendsOpenedFrameWithServerSuppliedWorkdir(t *testing
 	defer mgr.Close()
 
 	sender := &captureSender{}
-	bridge := newTerminalBridge(mgr, slog.Default(), sender.send)
+	bridge := newTerminalBridge(mgr, slog.Default(), sender.send, sender.sendCtx)
 
 	openPayload, err := json.Marshal(protocol.TerminalOpenPayload{
 		RequestID:      "req-1",
@@ -180,7 +191,7 @@ func TestTerminalBridge_OpenWithoutWorkdirEmitsTaskNotFound(t *testing.T) {
 	defer mgr.Close()
 
 	sender := &captureSender{}
-	bridge := newTerminalBridge(mgr, slog.Default(), sender.send)
+	bridge := newTerminalBridge(mgr, slog.Default(), sender.send, sender.sendCtx)
 
 	openPayload, _ := json.Marshal(protocol.TerminalOpenPayload{
 		RequestID:   "req-2",
@@ -221,7 +232,7 @@ func TestTerminalBridge_DataAndExitRoundTrip(t *testing.T) {
 	defer mgr.Close()
 
 	sender := &captureSender{}
-	bridge := newTerminalBridge(mgr, slog.Default(), sender.send)
+	bridge := newTerminalBridge(mgr, slog.Default(), sender.send, sender.sendCtx)
 
 	openPayload, _ := json.Marshal(protocol.TerminalOpenPayload{
 		RequestID:   "req-3",

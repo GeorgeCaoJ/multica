@@ -19,29 +19,37 @@ import (
 //   - relays PtySession.ExitC()  → terminal.exit frames
 //   - tears the bridge goroutine down when Done() fires
 //
-// frameSender is the daemon's currently-active WS writer (see
-// Daemon.sendWSFrame). It returns false when no connection is active or the
-// outbound queue is saturated; we drop the frame in that case rather than
-// stall the reader, because the next reconnect would unstick us anyway.
+// Two send paths are wired:
+//
+//   - send       (non-blocking): used for control / handshake frames that
+//                are safe to drop on backlog (terminal.opened, terminal.exit,
+//                terminal.error). Maps to Daemon.sendWSFrame.
+//   - sendCtx    (blocking with ctx escape): used for PTY data frames so a
+//                saturated hub writer back-pressures the producer instead
+//                of corrupting the terminal byte stream. Maps to
+//                Daemon.sendWSFrameCtx.
 type terminalBridge struct {
 	manager *terminal.Manager
 	logger  *slog.Logger
 	send    func([]byte) bool
+	sendCtx func(context.Context, []byte) bool
 
 	mu       sync.Mutex
 	sessions map[string]*terminalRoute
 }
 
 type terminalRoute struct {
-	session *terminal.PtySession
-	cancel  context.CancelFunc
+	session  *terminal.PtySession
+	cancel   context.CancelFunc
+	pumpDone chan struct{}
 }
 
-func newTerminalBridge(mgr *terminal.Manager, logger *slog.Logger, send func([]byte) bool) *terminalBridge {
+func newTerminalBridge(mgr *terminal.Manager, logger *slog.Logger, send func([]byte) bool, sendCtx func(context.Context, []byte) bool) *terminalBridge {
 	return &terminalBridge{
 		manager:  mgr,
 		logger:   logger,
 		send:     send,
+		sendCtx:  sendCtx,
 		sessions: make(map[string]*terminalRoute),
 	}
 }
@@ -102,8 +110,9 @@ func (b *terminalBridge) handleOpen(p protocol.TerminalOpenPayload) {
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
+	pumpDone := make(chan struct{})
 	b.mu.Lock()
-	b.sessions[sess.ID()] = &terminalRoute{session: sess, cancel: cancel}
+	b.sessions[sess.ID()] = &terminalRoute{session: sess, cancel: cancel, pumpDone: pumpDone}
 	b.mu.Unlock()
 
 	b.sendFrame(protocol.MessageTypeTerminalOpened, protocol.TerminalOpenedPayload{
@@ -113,7 +122,10 @@ func (b *terminalBridge) handleOpen(p protocol.TerminalOpenPayload) {
 		Shell:     sess.Shell(),
 	})
 
-	go b.pump(ctx, sess)
+	go func() {
+		defer close(pumpDone)
+		b.pump(ctx, sess)
+	}()
 }
 
 func (b *terminalBridge) handleData(p protocol.TerminalDataPayload) {
@@ -160,6 +172,12 @@ func (b *terminalBridge) handleClose(p protocol.TerminalClosePayload) {
 // pump bridges one session's output channel onto the WS as terminal.data
 // frames, and emits a terminal.exit when the child exits. Returns when
 // either the session is fully torn down or ctx is cancelled.
+//
+// terminal.data is delivered with REAL backpressure (sendDataFrame blocks
+// on a full hub writer). That is intentional: a saturated writer must
+// slow the PTY reader down, not drop bytes — half-streams break shells
+// far worse than a momentary lag. Heartbeat / control frames still go
+// through the droppable send path because they are recoverable.
 func (b *terminalBridge) pump(ctx context.Context, sess *terminal.PtySession) {
 	sessionID := sess.ID()
 	defer func() {
@@ -189,18 +207,51 @@ func (b *terminalBridge) pump(ctx context.Context, sess *terminal.PtySession) {
 				<-sess.Done()
 				return
 			}
-			b.sendFrame(protocol.MessageTypeTerminalData, protocol.TerminalDataPayload{
-				SessionID: sessionID,
-				DataB64:   base64.StdEncoding.EncodeToString(chunk),
-			})
+			if !b.sendDataFrame(ctx, sessionID, chunk) {
+				// ctx canceled (bridge being torn down) — bail. We don't
+				// emit a terminal.exit here: the teardown path on the
+				// caller side already accounts for the session going away.
+				return
+			}
 		}
 	}
+}
+
+// sendDataFrame is the backpressure-aware variant of sendFrame, used only
+// for terminal.data. Returns false iff ctx was canceled mid-send (i.e.,
+// the bridge is being torn down).
+func (b *terminalBridge) sendDataFrame(ctx context.Context, sessionID string, chunk []byte) bool {
+	raw, err := json.Marshal(protocol.TerminalDataPayload{
+		SessionID: sessionID,
+		DataB64:   base64.StdEncoding.EncodeToString(chunk),
+	})
+	if err != nil {
+		b.logger.Debug("terminal data payload marshal failed", "error", err, "session_id", sessionID)
+		return true
+	}
+	frame, err := json.Marshal(protocol.Message{Type: protocol.MessageTypeTerminalData, Payload: raw})
+	if err != nil {
+		b.logger.Debug("terminal data envelope marshal failed", "error", err, "session_id", sessionID)
+		return true
+	}
+	if b.sendCtx == nil {
+		// Defensive: pre-test bridges may not have plumbed sendCtx. Fall
+		// back to the non-blocking sender so existing tests still run.
+		_ = b.send(frame)
+		return true
+	}
+	return b.sendCtx(ctx, frame)
 }
 
 // closeAll tears down every live session. Called when the daemon
 // disconnects from the server: the browser proxy will fail downstream,
 // and a reconnect cannot resurrect the pre-existing PTYs because the
 // session_ids only existed in the prior WS context.
+//
+// closeAll BLOCKS until every pump goroutine has actually exited. The
+// wakeup loop relies on this guarantee: after closeAll returns, no pump
+// goroutine can still be calling sendWSFrameCtx, so the wakeup loop can
+// safely close the writes channel without racing producers.
 func (b *terminalBridge) closeAll(reason string) {
 	b.mu.Lock()
 	routes := make([]*terminalRoute, 0, len(b.sessions))
@@ -211,6 +262,11 @@ func (b *terminalBridge) closeAll(reason string) {
 	for _, r := range routes {
 		r.cancel()
 		r.session.Close(reason)
+	}
+	for _, r := range routes {
+		if r.pumpDone != nil {
+			<-r.pumpDone
+		}
 	}
 }
 
