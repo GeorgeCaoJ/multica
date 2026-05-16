@@ -120,7 +120,7 @@ function Segmented<T extends string | number>({
  */
 export function DashboardPage() {
   const { t } = useT("usage");
-  const { t: tRuntimes } = useT("runtimes");
+  const { t: tCommon } = useT("common");
   const wsId = useWorkspaceId();
   const [days, setDays] = useState<TimeRange>(30);
   const [projectValue, setProjectValue] = useState<string>(ALL_PROJECTS);
@@ -237,7 +237,7 @@ export function DashboardPage() {
           <TimezoneSelect
             value={timezone}
             onValueChange={setTimezone}
-            browserSuffix={tRuntimes(($) => $.detail.timezone_browser_suffix)}
+            browserSuffix={tCommon(($) => $.timezone_browser_suffix)}
             triggerClassName="rounded-md font-mono text-xs"
           />
         </div>
