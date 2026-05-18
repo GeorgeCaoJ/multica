@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
-	"sort"
 	"strconv"
 	"time"
 
@@ -78,13 +77,18 @@ const commentHardCap = 2000
 //     comment plus every descendant. The anchor may be a root or any reply;
 //     the server walks up to the root via a recursive CTE, so callers do not
 //     need to know whether the id they have is a root.
-//   - recent=<N> — return the most recent N comments for the issue. Combine
-//     with before / before-id (composite cursor) to scroll further back.
-//   - before=<RFC3339> + before-id=<uuid> — composite cursor for stable
-//     pagination under the existing (created_at ASC, id ASC) total order.
-//     Both must be set or neither; plain time-only `before` is rejected
-//     because rows sharing a microsecond can otherwise be skipped or
-//     duplicated.
+//   - recent=<N> — return the N most recently active threads (root + every
+//     descendant per thread). A thread's recency is MAX(created_at) across
+//     the whole subtree, so a stale-but-recently-replied thread ranks ahead
+//     of an active-but-quiet one. Row-based "newest N comments" is
+//     deliberately NOT exposed — it surfaces unrelated thread tails and
+//     hides relevant history (#2340).
+//   - before=<RFC3339> + before-id=<uuid> — thread cursor. The pair points at
+//     a thread's (last_activity_at, root_id); the next page returns threads
+//     strictly less recent. Both must be set together — a timestamp-only
+//     cursor cannot tie-break two threads whose last_activity falls in the
+//     same microsecond. The cursor for the next page is emitted via the
+//     X-Multica-Next-Before / X-Multica-Next-Before-Id response headers.
 //
 // Combination rules (kept narrow on purpose — Elon flagged the matrix risk):
 //
@@ -92,12 +96,13 @@ const commentHardCap = 2000
 //     most recent N within thread X" or "thread X but only before T" mixes
 //     two different navigation models and is rejected with 400.
 //   - thread may combine with since (incremental polling of one thread).
-//   - recent may combine with before/before-id (scroll older) and with since
-//     (recent activity in a window).
+//   - recent may combine with before/before-id (scroll older threads) and
+//     with since (recent activity in a window).
 //   - since may combine with anything except (thread + recent / before).
 //
-// The response is always chronological (oldest → newest), even when the
-// underlying query orders DESC, so agents can feed it to a prompt verbatim.
+// The response body is always chronological (oldest → newest); under recent
+// that means threads are listed oldest-active first and the freshest thread
+// sits at the tail, closest to "now" in an agent prompt.
 func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 	issueID := chi.URLParam(r, "id")
 	issue, ok := h.loadIssueForUser(w, r, issueID)
@@ -189,7 +194,7 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 		recentN = n
 	}
 
-	comments, err := h.fetchCommentsForList(r.Context(), fetchCommentsArgs{
+	result, err := h.fetchCommentsForList(r.Context(), fetchCommentsArgs{
 		Issue:        issue,
 		Since:        sinceTime,
 		ThreadAnchor: threadStr,
@@ -212,17 +217,26 @@ func (h *Handler) ListComments(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	commentIDs := make([]pgtype.UUID, len(comments))
-	for i, c := range comments {
+	commentIDs := make([]pgtype.UUID, len(result.Comments))
+	for i, c := range result.Comments {
 		commentIDs[i] = c.ID
 	}
 	grouped := h.groupReactions(r, commentIDs)
 	groupedAtt := h.groupAttachments(r, commentIDs)
 
-	resp := make([]CommentResponse, len(comments))
-	for i, c := range comments {
+	resp := make([]CommentResponse, len(result.Comments))
+	for i, c := range result.Comments {
 		cid := uuidToString(c.ID)
 		resp[i] = commentToResponse(c, grouped[cid], groupedAtt[cid])
+	}
+
+	// Emit the next thread cursor as response headers when the recent page is
+	// likely not the last one (returned a full page of threads). Headers stay
+	// out of the JSON body so the default flat-array response shape — which
+	// the desktop UI and existing callers depend on — is unchanged.
+	if result.NextBefore != "" && result.NextBeforeID != "" {
+		w.Header().Set("X-Multica-Next-Before", result.NextBefore)
+		w.Header().Set("X-Multica-Next-Before-Id", result.NextBeforeID)
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -241,6 +255,16 @@ type fetchCommentsArgs struct {
 	BeforeID     pgtype.UUID
 }
 
+// fetchCommentsResult carries both the materialised comments and (for the
+// recent/thread-grouped path) the cursor to use for the next page. Cursor
+// fields are empty strings when there is no next page or the path does not
+// support cursors.
+type fetchCommentsResult struct {
+	Comments     []db.Comment
+	NextBefore   string
+	NextBeforeID string
+}
+
 var (
 	errCommentThreadNotFound = &commentFetchError{"thread anchor not found"}
 	errCommentThreadBadID    = &commentFetchError{"invalid thread anchor id"}
@@ -250,7 +274,7 @@ type commentFetchError struct{ msg string }
 
 func (e *commentFetchError) Error() string { return e.msg }
 
-func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsArgs) ([]db.Comment, error) {
+func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsArgs) (fetchCommentsResult, error) {
 	issue := args.Issue
 
 	// Thread-scoped read. Server resolves the anchor → root via recursive
@@ -258,7 +282,7 @@ func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsAr
 	if args.ThreadAnchor != "" {
 		anchor, err := util.ParseUUID(args.ThreadAnchor)
 		if err != nil {
-			return nil, errCommentThreadBadID
+			return fetchCommentsResult{}, errCommentThreadBadID
 		}
 		rows, err := h.Queries.ListThreadCommentsForIssue(ctx, db.ListThreadCommentsForIssueParams{
 			AnchorID:    anchor,
@@ -267,10 +291,10 @@ func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsAr
 			RowLimit:    commentHardCap,
 		})
 		if err != nil {
-			return nil, err
+			return fetchCommentsResult{}, err
 		}
 		if len(rows) == 0 {
-			return nil, errCommentThreadNotFound
+			return fetchCommentsResult{}, errCommentThreadNotFound
 		}
 		out := make([]db.Comment, 0, len(rows))
 		for _, r := range rows {
@@ -293,61 +317,96 @@ func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsAr
 				ResolvedByID:   r.ResolvedByID,
 			})
 		}
-		return out, nil
+		return fetchCommentsResult{Comments: out}, nil
 	}
 
-	// Recent-N read, optionally bounded by composite cursor.
+	// Thread-grouped recent read: N most recently active threads.
 	if args.RecentN > 0 {
-		rows, err := h.Queries.ListRecentCommentsForIssue(ctx, db.ListRecentCommentsForIssueParams{
-			IssueID:         issue.ID,
-			WorkspaceID:     issue.WorkspaceID,
-			HasCursor:       args.HasCursor,
-			BeforeCreatedAt: args.BeforeAt,
-			BeforeID:        args.BeforeID,
-			RowLimit:        int32(args.RecentN),
+		rows, err := h.Queries.ListRecentThreadCommentsForIssue(ctx, db.ListRecentThreadCommentsForIssueParams{
+			IssueID:     issue.ID,
+			WorkspaceID: issue.WorkspaceID,
+			HasCursor:   args.HasCursor,
+			BeforeAt:    args.BeforeAt,
+			BeforeID:    args.BeforeID,
+			ThreadLimit: int32(args.RecentN),
 		})
 		if err != nil {
-			return nil, err
+			return fetchCommentsResult{}, err
 		}
-		// Optional since filter on top of recent — answers "what's new in
-		// the last N" without pulling the full timeline.
-		if args.Since.Valid {
-			filtered := rows[:0]
-			for _, c := range rows {
-				if c.CreatedAt.Time.After(args.Since.Time) {
-					filtered = append(filtered, c)
-				}
+
+		// The SQL already orders rows by (last_activity_at ASC, root_id ASC,
+		// created_at ASC, id ASC), so the OLDEST-active thread sits at the
+		// head and the FRESHEST thread at the tail. Walk the rows once to:
+		//   1. Strip the thread-metadata columns down to db.Comment for the
+		//      caller (uniform shape across paths).
+		//   2. Count distinct threads in the page so we know whether a "next
+		//      older page" is likely to exist.
+		//   3. Capture the head thread's (last_activity_at, root_id) — that
+		//      is the cursor for the next page (next page = threads strictly
+		//      less recent than this one).
+		comments := make([]db.Comment, 0, len(rows))
+		var headRoot pgtype.UUID
+		var headLast pgtype.Timestamptz
+		seenRoot := map[string]struct{}{}
+		for _, r := range rows {
+			if !headRoot.Valid {
+				headRoot = r.ThreadRootID
+				headLast = r.ThreadLastActivityAt
 			}
-			rows = filtered
+			seenRoot[uuidToString(r.ThreadRootID)] = struct{}{}
+			// Since filter on the recent path: drop comments older than
+			// `since`. Done in-memory so we keep the thread-grouped
+			// semantics from the query (don't pre-filter rows before the
+			// MAX(created_at) ranking — that would silently downgrade a
+			// thread whose most recent activity falls inside the window).
+			if args.Since.Valid && !r.CreatedAt.Time.After(args.Since.Time) {
+				continue
+			}
+			comments = append(comments, db.Comment{
+				ID:             r.ID,
+				IssueID:        r.IssueID,
+				AuthorType:     r.AuthorType,
+				AuthorID:       r.AuthorID,
+				Content:        r.Content,
+				Type:           r.Type,
+				CreatedAt:      r.CreatedAt,
+				UpdatedAt:      r.UpdatedAt,
+				ParentID:       r.ParentID,
+				WorkspaceID:    r.WorkspaceID,
+				ResolvedAt:     r.ResolvedAt,
+				ResolvedByType: r.ResolvedByType,
+				ResolvedByID:   r.ResolvedByID,
+			})
 		}
-		// DESC → chronological so the response shape matches the default
-		// path. Callers can always re-sort, but giving them the same order
-		// as the existing endpoint avoids surprises.
-		sort.Slice(rows, func(i, j int) bool {
-			a, b := rows[i].CreatedAt.Time, rows[j].CreatedAt.Time
-			if !a.Equal(b) {
-				return a.Before(b)
-			}
-			return uuidToString(rows[i].ID) < uuidToString(rows[j].ID)
-		})
-		return rows, nil
+
+		// Only emit a cursor when the page is full. Fewer threads than
+		// requested ⇒ the SELECT exhausted matching threads, so there is
+		// no older page to scroll to.
+		out := fetchCommentsResult{Comments: comments}
+		if len(seenRoot) >= args.RecentN && headRoot.Valid && headLast.Valid {
+			out.NextBefore = headLast.Time.UTC().Format(time.RFC3339Nano)
+			out.NextBeforeID = uuidToString(headRoot)
+		}
+		return out, nil
 	}
 
 	// Default + since paths preserved verbatim (no behavioural change for
 	// existing callers).
 	if args.Since.Valid {
-		return h.Queries.ListCommentsSinceForIssue(ctx, db.ListCommentsSinceForIssueParams{
+		comments, err := h.Queries.ListCommentsSinceForIssue(ctx, db.ListCommentsSinceForIssueParams{
 			IssueID:     issue.ID,
 			WorkspaceID: issue.WorkspaceID,
 			CreatedAt:   args.Since,
 			Limit:       commentHardCap,
 		})
+		return fetchCommentsResult{Comments: comments}, err
 	}
-	return h.Queries.ListCommentsForIssue(ctx, db.ListCommentsForIssueParams{
+	comments, err := h.Queries.ListCommentsForIssue(ctx, db.ListCommentsForIssueParams{
 		IssueID:     issue.ID,
 		WorkspaceID: issue.WorkspaceID,
 		Limit:       commentHardCap,
 	})
+	return fetchCommentsResult{Comments: comments}, err
 }
 
 type CreateCommentRequest struct {

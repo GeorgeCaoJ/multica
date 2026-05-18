@@ -14,9 +14,12 @@ import (
 )
 
 // cursorQuery builds a properly URL-encoded query string for the recent +
-// cursor path. RFC3339 timestamps contain `:` and may contain `+`, both of
-// which need escaping so they survive `(*url.URL).Query()` parsing on the
-// server side.
+// thread-cursor path. RFC3339Nano timestamps contain `:` and may contain `+`,
+// both of which need escaping so they survive `(*url.URL).Query()` parsing on
+// the server side.
+//
+// `before` and `beforeID` here name a *thread* (last_activity_at, root_id),
+// not a single row — the recent path is thread-grouped (#2340).
 func cursorQuery(recent int, before, beforeID string) string {
 	v := url.Values{}
 	if recent > 0 {
@@ -29,6 +32,13 @@ func cursorQuery(recent int, before, beforeID string) string {
 		v.Set("before_id", beforeID)
 	}
 	return v.Encode()
+}
+
+// nextThreadCursor reads the (before, before-id) headers the recent path
+// emits when there is likely an older page to scroll to. Empty pair means
+// the server signalled "no more threads".
+func nextThreadCursor(w *httptest.ResponseRecorder) (string, string) {
+	return w.Header().Get("X-Multica-Next-Before"), w.Header().Get("X-Multica-Next-Before-Id")
 }
 
 // commentListFixture seeds an issue with a known comment graph for the
@@ -223,49 +233,44 @@ func TestListComments_ThreadAnchorErrors(t *testing.T) {
 	})
 }
 
-// TestListComments_RecentReturnsMostRecentInChronologicalOrder verifies
-// the recent path returns the newest N comments but reorders them to
-// chronological so the response shape matches the default list. Agents
-// can feed it to a prompt verbatim.
-func TestListComments_RecentReturnsMostRecentInChronologicalOrder(t *testing.T) {
+// TestListComments_RecentReturnsMostRecentlyActiveThreads pins the
+// thread-grouped semantics from #2340. Row-based "newest N comments" would
+// have surfaced [root2, r2a, r2b] for N=3 — a single thread's tail. The
+// thread-grouped path treats the unit as a thread (root + descendants) and
+// ranks threads by MAX(created_at) over the subtree, so:
+//
+//   - recent=1 → the single freshest-active thread (root2 thread) fully
+//     expanded, oldest-active thread suppressed.
+//   - recent=2 → both threads, with the older-active thread first so the
+//     freshest sits at the prompt tail (closest to "now").
+func TestListComments_RecentReturnsMostRecentlyActiveThreads(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
 	fx := newCommentListFixture(t)
 
-	_, rows := listComments(t, fx.IssueID, "recent=3")
-	// 7 comments total; newest 3 are r2a, r2b plus root2 — but ordered DESC
-	// the newest 3 are r2b, r2a, root2. Reversed to chronological:
-	want := []string{fx.Root2, fx.R2a, fx.R2b}
-	eqIDs(t, ids(rows), want, "recent=3")
+	t.Run("recent=1 returns the freshest-active thread fully", func(t *testing.T) {
+		_, rows := listComments(t, fx.IssueID, "recent=1")
+		eqIDs(t, ids(rows), []string{fx.Root2, fx.R2a, fx.R2b}, "recent=1")
+	})
+
+	t.Run("recent=2 returns both threads, older-active first", func(t *testing.T) {
+		_, rows := listComments(t, fx.IssueID, "recent=2")
+		// Threads sorted by (last_activity_at ASC, root_id ASC):
+		//   root1 thread (last_activity = base + 3m via r1b1) FIRST
+		//   root2 thread (last_activity = base + 12m via r2b) SECOND
+		// In-thread ordering is chronological.
+		want := []string{fx.Root1, fx.R1a, fx.R1b, fx.R1b1, fx.Root2, fx.R2a, fx.R2b}
+		eqIDs(t, ids(rows), want, "recent=2")
+	})
 }
 
-// TestListComments_RecentWithCompositeCursor exercises Elon's point 3:
-// (created_at, id) is the stable cursor — paging with --before+--before-id
-// returns the next page without skipping or duplicating rows.
-func TestListComments_RecentWithCompositeCursor(t *testing.T) {
-	if testHandler == nil || testPool == nil {
-		t.Skip("database not available")
-	}
-	fx := newCommentListFixture(t)
-
-	// First page: newest 3 = [root2, r2a, r2b] (chronological).
-	_, page1 := listComments(t, fx.IssueID, "recent=3")
-	eqIDs(t, ids(page1), []string{fx.Root2, fx.R2a, fx.R2b}, "page1")
-
-	// Cursor = oldest row in page1 (root2). Asking for the next 3 with that
-	// cursor must skip everything ≥ root2 and return [r1a, r1b, r1b1] (the
-	// next 3 newest before root2, ordered chronologically).
-	cursor := page1[0]
-	_, page2 := listComments(t, fx.IssueID, cursorQuery(3, cursor.CreatedAt, cursor.ID))
-	eqIDs(t, ids(page2), []string{fx.R1a, fx.R1b, fx.R1b1}, "page2 after cursor")
-}
-
-// TestListComments_CompositeCursorStableUnderSameTimestamp pins the actual
-// purpose of the composite cursor: when two rows share a created_at the
-// (created_at, id) ordering disambiguates them. A timestamp-only cursor
-// would either skip one or return the same row twice across pages.
-func TestListComments_CompositeCursorStableUnderSameTimestamp(t *testing.T) {
+// TestListComments_RecentRanksStaleThreadAheadIfRecentlyReplied makes the
+// MAX(created_at) ranking explicit: a thread whose root is old but which has
+// a fresh reply must outrank a thread whose root is newer but quiet. Without
+// this, "recent" decays into "most recent root" and misses the very signal
+// that thread-grouping was meant to surface.
+func TestListComments_RecentRanksStaleThreadAheadIfRecentlyReplied(t *testing.T) {
 	if testHandler == nil || testPool == nil {
 		t.Skip("database not available")
 	}
@@ -275,7 +280,134 @@ func TestListComments_CompositeCursorStableUnderSameTimestamp(t *testing.T) {
 	if err := testPool.QueryRow(ctx, `
 		INSERT INTO issue (workspace_id, creator_type, creator_id, title)
 		VALUES ($1, 'member', $2, $3) RETURNING id
-	`, testWorkspaceID, testUserID, "tie-break fixture").Scan(&issueID); err != nil {
+	`, testWorkspaceID, testUserID, "stale-but-fresh fixture").Scan(&issueID); err != nil {
+		t.Fatalf("create issue: %v", err)
+	}
+	t.Cleanup(func() {
+		testPool.Exec(context.Background(), `DELETE FROM issue WHERE id = $1`, issueID)
+	})
+
+	base := time.Now().UTC().Add(-1 * time.Hour).Truncate(time.Second)
+	insert := func(parent *string, offset time.Duration, body string) string {
+		var id string
+		if err := testPool.QueryRow(ctx, `
+			INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, parent_id, created_at)
+			VALUES ($1, $2, 'member', $3, $4, 'comment', $5, $6) RETURNING id
+		`, issueID, testWorkspaceID, testUserID, body, parent, base.Add(offset)).Scan(&id); err != nil {
+			t.Fatalf("insert: %v", err)
+		}
+		return id
+	}
+
+	// Stale-then-fresh: oldRoot was created at t=0 but received a reply at
+	// t=30m. quietRoot was created at t=15m and never replied.
+	oldRoot := insert(nil, 0, "oldRoot")
+	quietRoot := insert(nil, 15*time.Minute, "quietRoot")
+	freshReply := insert(&oldRoot, 30*time.Minute, "freshReply")
+
+	_, rows := listComments(t, issueID, "recent=1")
+	// Expected: only the oldRoot thread (oldRoot + freshReply). The
+	// quietRoot thread is suppressed because its last_activity_at is older
+	// than oldRoot's, even though its root was created later.
+	eqIDs(t, ids(rows), []string{oldRoot, freshReply}, "recent=1 picks freshly replied stale thread")
+	_ = quietRoot
+}
+
+// TestListComments_RecentEmitsThreadCursorWhenPageFull pins the header
+// contract: a full page (threads in response == --recent N) emits the
+// next-page cursor; an underfilled page emits nothing. The cursor points at
+// the OLDEST thread in the page — that is the upper bound for the next
+// (older) page.
+func TestListComments_RecentEmitsThreadCursorWhenPageFull(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newCommentListFixture(t)
+
+	t.Run("underfilled page emits no cursor", func(t *testing.T) {
+		// recent=5 with only 2 threads available — server has nothing older
+		// to offer. No cursor headers means the client stops paginating.
+		w, _ := listComments(t, fx.IssueID, "recent=5")
+		nb, nbid := nextThreadCursor(w)
+		if nb != "" || nbid != "" {
+			t.Fatalf("expected no cursor, got before=%q before_id=%q", nb, nbid)
+		}
+	})
+
+	t.Run("full page emits cursor pointing at oldest thread in page", func(t *testing.T) {
+		// recent=1: page is full (1 thread returned, 1 requested). Cursor
+		// must point at the (last_activity_at, root_id) of the only thread
+		// in the page so the next request can fetch older threads.
+		w, _ := listComments(t, fx.IssueID, "recent=1")
+		nb, nbid := nextThreadCursor(w)
+		if nbid != fx.Root2 {
+			t.Fatalf("cursor before_id = %q, want %q (root2 — newest thread)", nbid, fx.Root2)
+		}
+		if nb == "" {
+			t.Fatalf("cursor before is empty; expected RFC3339Nano timestamp")
+		}
+		if _, err := time.Parse(time.RFC3339Nano, nb); err != nil {
+			t.Fatalf("cursor before = %q is not RFC3339Nano: %v", nb, err)
+		}
+	})
+}
+
+// TestListComments_RecentWithThreadCursorScrollsOlderThreads walks the issue
+// thread-by-thread using the cursor the server emits. Pinning this avoids
+// the row-based regression where a "newest N comments" cursor would interleave
+// rows from multiple threads and skip thread membership across pages.
+func TestListComments_RecentWithThreadCursorScrollsOlderThreads(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	fx := newCommentListFixture(t)
+
+	// Page 1: newest thread = root2.
+	w1, page1 := listComments(t, fx.IssueID, "recent=1")
+	eqIDs(t, ids(page1), []string{fx.Root2, fx.R2a, fx.R2b}, "page1 = root2 thread")
+	nb, nbid := nextThreadCursor(w1)
+	if nb == "" || nbid != fx.Root2 {
+		t.Fatalf("page1 cursor = (%q, %q), want (non-empty, %q)", nb, nbid, fx.Root2)
+	}
+
+	// Page 2: cursor points at root2 → server returns the next older thread
+	// (root1). All of root1's descendants come along.
+	w2, page2 := listComments(t, fx.IssueID, cursorQuery(1, nb, nbid))
+	eqIDs(t, ids(page2), []string{fx.Root1, fx.R1a, fx.R1b, fx.R1b1}, "page2 = root1 thread")
+
+	// Page 3: cursor points at root1 → no older threads exist, page is
+	// empty AND no cursor is emitted.
+	nb2, nbid2 := nextThreadCursor(w2)
+	if nb2 == "" || nbid2 != fx.Root1 {
+		t.Fatalf("page2 cursor = (%q, %q), want (non-empty, %q)", nb2, nbid2, fx.Root1)
+	}
+	w3, page3 := listComments(t, fx.IssueID, cursorQuery(1, nb2, nbid2))
+	if len(page3) != 0 {
+		t.Fatalf("page3: expected empty (no older threads), got %d rows: %v", len(page3), ids(page3))
+	}
+	nb3, nbid3 := nextThreadCursor(w3)
+	if nb3 != "" || nbid3 != "" {
+		t.Fatalf("page3 cursor = (%q, %q), want both empty (end-of-list)", nb3, nbid3)
+	}
+}
+
+// TestListComments_ThreadCursorStableUnderSameLastActivity locks the
+// tie-break invariant for the thread cursor. Three threads with identical
+// last_activity_at must paginate one-at-a-time without skips or duplicates,
+// because (last_activity_at, root_id) — not just last_activity_at — is the
+// total order. A timestamp-only cursor would either drop one thread or
+// surface the same thread twice when ties land in the same microsecond.
+func TestListComments_ThreadCursorStableUnderSameLastActivity(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+
+	var issueID string
+	if err := testPool.QueryRow(ctx, `
+		INSERT INTO issue (workspace_id, creator_type, creator_id, title)
+		VALUES ($1, 'member', $2, $3) RETURNING id
+	`, testWorkspaceID, testUserID, "thread tie-break fixture").Scan(&issueID); err != nil {
 		t.Fatalf("create issue: %v", err)
 	}
 	t.Cleanup(func() {
@@ -283,7 +415,7 @@ func TestListComments_CompositeCursorStableUnderSameTimestamp(t *testing.T) {
 	})
 
 	ts := time.Now().UTC().Add(-30 * time.Minute).Truncate(time.Millisecond)
-	insert := func(body string) string {
+	insertRoot := func(body string) string {
 		var id string
 		if err := testPool.QueryRow(ctx, `
 			INSERT INTO comment (issue_id, workspace_id, author_type, author_id, content, type, created_at)
@@ -293,41 +425,48 @@ func TestListComments_CompositeCursorStableUnderSameTimestamp(t *testing.T) {
 		}
 		return id
 	}
-	a := insert("a")
-	b := insert("b")
-	c := insert("c")
+	a := insertRoot("a")
+	b := insertRoot("b")
+	c := insertRoot("c")
 
-	// All three share `ts`; the total order is (ts, id) which lexicographic
-	// ordering of the UUID strings determines. Pull all three to learn the
-	// canonical order, then page through with size 1 to assert no skip / dup.
-	_, all := listComments(t, issueID, "")
-	if len(all) != 3 {
-		t.Fatalf("seed: expected 3 comments, got %d", len(all))
+	// All three threads have last_activity_at = ts (each root is also the
+	// thread's only comment). Order is (ts, root_id) — UUID lex tie-break.
+	// Build canonical order by sorting the root ids and reversing (the SQL
+	// orders DESC for selection).
+	sorted := []string{a, b, c}
+	for i := 0; i < len(sorted); i++ {
+		for j := i + 1; j < len(sorted); j++ {
+			if sorted[i] > sorted[j] {
+				sorted[i], sorted[j] = sorted[j], sorted[i]
+			}
+		}
 	}
-	want := ids(all) // canonical chronological order
+	// Newest-first selection walks UUIDs DESC, so the page-1 thread is the
+	// largest UUID; response is then ordered ASC (oldest-active first =
+	// smallest-UUID-among-current-page) — with recent=1 there's only one
+	// thread per page so the body shows that thread alone.
+	wantOrder := []string{sorted[2], sorted[1], sorted[0]}
 
-	_, page1 := listComments(t, issueID, "recent=1")
-	if len(page1) != 1 {
-		t.Fatalf("page1: expected 1, got %d", len(page1))
+	var got []string
+	w, page := listComments(t, issueID, "recent=1")
+	if len(page) != 1 {
+		t.Fatalf("page1: expected 1 thread (1 row), got %d", len(page))
 	}
-	got := []string{page1[0].ID}
+	got = append(got, page[0].ID)
 
-	cursor := page1[0]
 	for i := 0; i < 2; i++ {
-		_, page := listComments(t, issueID, cursorQuery(1, cursor.CreatedAt, cursor.ID))
+		nb, nbid := nextThreadCursor(w)
+		if nb == "" || nbid == "" {
+			t.Fatalf("page %d: missing cursor headers", i+1)
+		}
+		w, page = listComments(t, issueID, cursorQuery(1, nb, nbid))
 		if len(page) != 1 {
-			t.Fatalf("page %d: expected 1, got %d", i+2, len(page))
+			t.Fatalf("page %d: expected 1 thread (1 row), got %d", i+2, len(page))
 		}
 		got = append(got, page[0].ID)
-		cursor = page[0]
 	}
 
-	// Newest-first walk gives the reverse of canonical chronological order.
-	wantReverse := []string{want[2], want[1], want[0]}
-	_ = a
-	_ = b
-	_ = c
-	eqIDs(t, got, wantReverse, "paginated walk")
+	eqIDs(t, got, wantOrder, "paginated walk")
 }
 
 // TestListComments_FlagCombinationRules locks Elon's point 4. The matrix is

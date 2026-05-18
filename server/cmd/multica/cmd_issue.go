@@ -310,9 +310,9 @@ func init() {
 	issueCommentListCmd.Flags().String("output", "table", "Output format: table or json")
 	issueCommentListCmd.Flags().String("since", "", "Only return comments created after this timestamp (RFC3339)")
 	issueCommentListCmd.Flags().String("thread", "", "Comment UUID — return the thread containing this comment (root + every descendant). May be a root or a reply id.")
-	issueCommentListCmd.Flags().Int("recent", 0, "Return only the most recent N comments for the issue. Combine with --before/--before-id to scroll older.")
-	issueCommentListCmd.Flags().String("before", "", "RFC3339 cursor for --recent pagination. Must be paired with --before-id (composite cursor).")
-	issueCommentListCmd.Flags().String("before-id", "", "Comment UUID cursor for --recent pagination. Must be paired with --before.")
+	issueCommentListCmd.Flags().Int("recent", 0, "Return the N most recently active threads (root + descendants per thread). Use --before/--before-id from the previous response to scroll to older threads.")
+	issueCommentListCmd.Flags().String("before", "", "Thread cursor: last_activity_at (RFC3339Nano). Read from the X-Multica-Next-Before response header; must be paired with --before-id.")
+	issueCommentListCmd.Flags().String("before-id", "", "Thread cursor: root comment UUID. Read from the X-Multica-Next-Before-Id response header; must be paired with --before.")
 
 	// issue runs
 	issueRunsCmd.Flags().String("output", "table", "Output format: table or json")
@@ -978,10 +978,20 @@ func runIssueCommentList(cmd *cobra.Command, args []string) error {
 	}
 
 	var comments []map[string]any
-	if err := client.GetJSON(ctx, path, &comments); err != nil {
+	respHeaders, err := client.GetJSONWithHeaders(ctx, path, &comments)
+	if err != nil {
 		return fmt.Errorf("list comments: %w", err)
 	}
 	fmt.Fprintf(os.Stderr, "Showing %d comments.\n", len(comments))
+	// Under --recent the server emits a thread cursor in headers when there
+	// is likely an older page. Surface it on stderr so an operator (and the
+	// agent prompt update that follows this PR) can scroll deeper without
+	// having to dig into the raw HTTP response.
+	if nb := respHeaders.Get("X-Multica-Next-Before"); nb != "" {
+		if nbid := respHeaders.Get("X-Multica-Next-Before-Id"); nbid != "" {
+			fmt.Fprintf(os.Stderr, "Next thread cursor: --before %s --before-id %s\n", nb, nbid)
+		}
+	}
 
 	output, _ := cmd.Flags().GetString("output")
 	if output == "json" {

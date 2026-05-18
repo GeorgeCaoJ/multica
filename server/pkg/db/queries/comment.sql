@@ -58,24 +58,72 @@ FROM descendants
 ORDER BY created_at ASC, id ASC
 LIMIT @row_limit;
 
--- name: ListRecentCommentsForIssue :many
--- Returns the most recent N comments for an issue, optionally bounded above
--- by a (created_at, id) cursor. The composite cursor avoids the
--- same-timestamp duplicate/skip risk that plain `created_at < $x` has under
--- the existing (created_at ASC, id ASC) ordering. Pass @has_cursor = FALSE
--- and the cursor params are ignored (returns the absolute newest N).
-SELECT id, issue_id, author_type, author_id, content, type,
-       created_at, updated_at, parent_id, workspace_id,
-       resolved_at, resolved_by_type, resolved_by_id
-FROM comment
-WHERE issue_id = @issue_id
-  AND workspace_id = @workspace_id
-  AND (
-      @has_cursor::boolean = FALSE
-      OR (created_at, id) < (@before_created_at::timestamptz, @before_id::uuid)
-  )
-ORDER BY created_at DESC, id DESC
-LIMIT @row_limit;
+-- name: ListRecentThreadCommentsForIssue :many
+-- Returns the N most recently active threads (root + every descendant) rather
+-- than the N most recent rows. A thread's "last activity" is MAX(created_at)
+-- over its whole subtree; threads are ranked by (last_activity_at DESC,
+-- root_id DESC) and the top N are expanded.
+--
+-- Why thread-grouped instead of row-recent: with row-recent the newest 20
+-- comments can come from 8 different threads — the agent sees 8 unrelated
+-- tails. With thread-grouped the agent sees N complete conversational arcs,
+-- which matches how a human reads an issue (#2340).
+--
+-- Response ordering:
+--   threads:     (thread_last_activity_at ASC, root_id ASC)
+--   in-thread:   (created_at ASC, id ASC)
+-- So the oldest-active thread appears first and the most recently-active
+-- thread is at the tail, closest to "now" in an agent prompt.
+--
+-- Cursor scrolls back through threads. When @has_cursor=TRUE only threads
+-- with (last_activity_at, root_id) < (@before_at, @before_id) are eligible.
+-- The cursor is a THREAD cursor — both values identify a thread (its last
+-- activity timestamp and its root comment id), not a single row.
+--
+-- The recursive `membership` CTE labels each comment with its thread root by
+-- walking down from every root. It does not assume any maximum nesting depth,
+-- which preserves correctness even if the schema ever allows reply-of-reply
+-- (the agent path in TaskService.createAgentComment collapses to root today,
+-- but the user-facing CreateComment handler does not enforce it).
+WITH RECURSIVE membership(id, root_id, comment_created_at) AS (
+    -- Each root maps to itself.
+    SELECT c.id, c.id AS root_id, c.created_at
+    FROM comment c
+    WHERE c.issue_id = @issue_id
+      AND c.workspace_id = @workspace_id
+      AND c.parent_id IS NULL
+    UNION ALL
+    -- Each descendant inherits its parent's root_id.
+    SELECT c.id, m.root_id, c.created_at
+    FROM comment c
+    JOIN membership m ON c.parent_id = m.id
+    WHERE c.issue_id = @issue_id
+      AND c.workspace_id = @workspace_id
+),
+thread_stats AS (
+    SELECT root_id, MAX(comment_created_at)::timestamptz AS last_activity_at
+    FROM membership
+    GROUP BY root_id
+),
+picked AS (
+    SELECT ts.root_id, ts.last_activity_at
+    FROM thread_stats ts
+    WHERE (
+        @has_cursor::boolean = FALSE
+        OR (ts.last_activity_at, ts.root_id) < (@before_at::timestamptz, @before_id::uuid)
+    )
+    ORDER BY ts.last_activity_at DESC, ts.root_id DESC
+    LIMIT @thread_limit
+)
+SELECT c.id, c.issue_id, c.author_type, c.author_id, c.content, c.type,
+       c.created_at, c.updated_at, c.parent_id, c.workspace_id,
+       c.resolved_at, c.resolved_by_type, c.resolved_by_id,
+       p.root_id AS thread_root_id,
+       p.last_activity_at AS thread_last_activity_at
+FROM picked p
+JOIN membership m ON m.root_id = p.root_id
+JOIN comment c ON c.id = m.id
+ORDER BY p.last_activity_at ASC, p.root_id ASC, c.created_at ASC, c.id ASC;
 
 -- name: CountComments :one
 SELECT count(*) FROM comment
