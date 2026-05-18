@@ -638,21 +638,33 @@ func prettifyJSON(raw []byte) ([]byte, error) {
 	return json.MarshalIndent(v, "", "  ")
 }
 
-// interpolateTemplate replaces {{date}} in the issue title template.
+// issueTitleTemplateTokenRE matches any {{...}} token in an issue-title
+// template. We deliberately permit whitespace inside the braces ({{ date }})
+// so users can format templates either way; the canonical token is still
+// {{date}}.
+var issueTitleTemplateTokenRE = regexp.MustCompile(`\{\{\s*([^{}]*?)\s*\}\}`)
+
+// interpolateTemplate substitutes supported {{name}} placeholders in the
+// issue title template. Whitespace inside the braces ({{ date }}) is
+// tolerated so the render layer accepts every form that
+// ValidateIssueTitleTemplate accepts — otherwise users would save templates
+// that pass validation but still emit a literal token at trigger time.
 func (s *AutopilotService) interpolateTemplate(ap db.Autopilot) string {
 	tmpl := ap.Title
 	if ap.IssueTitleTemplate.Valid && ap.IssueTitleTemplate.String != "" {
 		tmpl = ap.IssueTitleTemplate.String
 	}
 	now := time.Now().UTC().Format("2006-01-02")
-	return strings.ReplaceAll(tmpl, "{{date}}", now)
+	return issueTitleTemplateTokenRE.ReplaceAllStringFunc(tmpl, func(match string) string {
+		name := strings.TrimSpace(match[2 : len(match)-2])
+		switch name {
+		case "date":
+			return now
+		default:
+			return match
+		}
+	})
 }
-
-// issueTitleTemplateTokenRE matches any {{...}} token in an issue-title
-// template. We deliberately permit whitespace inside the braces ({{ date }})
-// so users can format templates either way; the canonical token is still
-// {{date}}.
-var issueTitleTemplateTokenRE = regexp.MustCompile(`\{\{\s*([^{}]*?)\s*\}\}`)
 
 // SupportedIssueTitleTemplateVariables enumerates the placeholders that
 // interpolateTemplate will substitute. Keep this in sync with the

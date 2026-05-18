@@ -114,6 +114,11 @@ func TestInterpolateTemplate(t *testing.T) {
 			expect: "probe — " + today,
 		},
 		{
+			name:   "date placeholder with whitespace substituted",
+			ap:     db.Autopilot{Title: "fallback", IssueTitleTemplate: pgtype.Text{String: "probe — {{ date }}", Valid: true}},
+			expect: "probe — " + today,
+		},
+		{
 			name:   "empty template falls back to autopilot title",
 			ap:     db.Autopilot{Title: "fallback title", IssueTitleTemplate: pgtype.Text{Valid: false}},
 			expect: "fallback title",
