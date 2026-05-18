@@ -172,7 +172,7 @@ const getWebhookDeliveryByTriggerAndDedupe = `-- name: GetWebhookDeliveryByTrigg
 SELECT id, workspace_id, autopilot_id, trigger_id, provider, event, dedupe_key, dedupe_source, signature_status, status, attempt_count, selected_headers, content_type, raw_body, response_status, response_body, autopilot_run_id, replayed_from_delivery_id, error, received_at, last_attempt_at, created_at FROM webhook_delivery
 WHERE trigger_id = $1
   AND dedupe_key = $2
-ORDER BY (status = 'rejected'), created_at DESC
+ORDER BY (status IN ('rejected', 'failed')), created_at DESC
 LIMIT 1
 `
 
@@ -183,10 +183,11 @@ type GetWebhookDeliveryByTriggerAndDedupeParams struct {
 
 // Looks up the existing delivery for a (trigger, dedupe_key) pair so that
 // duplicate requests return the original delivery_id / autopilot_run_id.
-// Prefer non-rejected rows: the partial unique index allows multiple rejected
-// attempts with the same key, so without the ORDER BY we could return a
-// stale rejection even after the operator fixed the secret and a fresh
-// dispatch succeeded.
+// The partial unique index excludes terminal-but-not-successful statuses
+// (`rejected`, `failed`), so multiple such rows can coexist for the same
+// key. Prefer non-terminal rows in the lookup: without the ORDER BY we
+// could return a stale rejection / failure even after the operator fixed
+// the cause and a fresh dispatch succeeded.
 func (q *Queries) GetWebhookDeliveryByTriggerAndDedupe(ctx context.Context, arg GetWebhookDeliveryByTriggerAndDedupeParams) (WebhookDelivery, error) {
 	row := q.db.QueryRow(ctx, getWebhookDeliveryByTriggerAndDedupe, arg.TriggerID, arg.DedupeKey)
 	var i WebhookDelivery
@@ -259,7 +260,12 @@ func (q *Queries) GetWebhookDeliveryInWorkspace(ctx context.Context, arg GetWebh
 }
 
 const listWebhookDeliveriesByAutopilot = `-- name: ListWebhookDeliveriesByAutopilot :many
-SELECT d.id, d.workspace_id, d.autopilot_id, d.trigger_id, d.provider, d.event, d.dedupe_key, d.dedupe_source, d.signature_status, d.status, d.attempt_count, d.selected_headers, d.content_type, d.raw_body, d.response_status, d.response_body, d.autopilot_run_id, d.replayed_from_delivery_id, d.error, d.received_at, d.last_attempt_at, d.created_at
+SELECT
+    d.id, d.workspace_id, d.autopilot_id, d.trigger_id, d.provider, d.event,
+    d.dedupe_key, d.dedupe_source, d.signature_status, d.status,
+    d.attempt_count, d.content_type, d.response_status,
+    d.autopilot_run_id, d.replayed_from_delivery_id, d.error,
+    d.received_at, d.last_attempt_at, d.created_at
 FROM webhook_delivery d
 JOIN autopilot a ON a.id = d.autopilot_id
 WHERE d.autopilot_id = $1
@@ -275,9 +281,37 @@ type ListWebhookDeliveriesByAutopilotParams struct {
 	Offset      int32       `json:"offset"`
 }
 
+type ListWebhookDeliveriesByAutopilotRow struct {
+	ID                     pgtype.UUID        `json:"id"`
+	WorkspaceID            pgtype.UUID        `json:"workspace_id"`
+	AutopilotID            pgtype.UUID        `json:"autopilot_id"`
+	TriggerID              pgtype.UUID        `json:"trigger_id"`
+	Provider               string             `json:"provider"`
+	Event                  string             `json:"event"`
+	DedupeKey              pgtype.Text        `json:"dedupe_key"`
+	DedupeSource           pgtype.Text        `json:"dedupe_source"`
+	SignatureStatus        string             `json:"signature_status"`
+	Status                 string             `json:"status"`
+	AttemptCount           int32              `json:"attempt_count"`
+	ContentType            pgtype.Text        `json:"content_type"`
+	ResponseStatus         pgtype.Int4        `json:"response_status"`
+	AutopilotRunID         pgtype.UUID        `json:"autopilot_run_id"`
+	ReplayedFromDeliveryID pgtype.UUID        `json:"replayed_from_delivery_id"`
+	Error                  pgtype.Text        `json:"error"`
+	ReceivedAt             pgtype.Timestamptz `json:"received_at"`
+	LastAttemptAt          pgtype.Timestamptz `json:"last_attempt_at"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+}
+
 // Workspace-scoped via the join so a runId from another workspace cannot
 // leak. Newest first, paged by limit/offset.
-func (q *Queries) ListWebhookDeliveriesByAutopilot(ctx context.Context, arg ListWebhookDeliveriesByAutopilotParams) ([]WebhookDelivery, error) {
+//
+// Projection: large columns (`raw_body`, `selected_headers`, `response_body`)
+// are deliberately excluded. A 100-row page × 256 KiB raw_body would be
+// 25 MiB of bytes pulled from Postgres just to be dropped in the JSON
+// encoder — Deliveries tab would hit that on every reload. Detail views
+// fetch the full row via GetWebhookDelivery / GetWebhookDeliveryInWorkspace.
+func (q *Queries) ListWebhookDeliveriesByAutopilot(ctx context.Context, arg ListWebhookDeliveriesByAutopilotParams) ([]ListWebhookDeliveriesByAutopilotRow, error) {
 	rows, err := q.db.Query(ctx, listWebhookDeliveriesByAutopilot,
 		arg.AutopilotID,
 		arg.WorkspaceID,
@@ -288,9 +322,9 @@ func (q *Queries) ListWebhookDeliveriesByAutopilot(ctx context.Context, arg List
 		return nil, err
 	}
 	defer rows.Close()
-	items := []WebhookDelivery{}
+	items := []ListWebhookDeliveriesByAutopilotRow{}
 	for rows.Next() {
-		var i WebhookDelivery
+		var i ListWebhookDeliveriesByAutopilotRow
 		if err := rows.Scan(
 			&i.ID,
 			&i.WorkspaceID,
@@ -303,11 +337,8 @@ func (q *Queries) ListWebhookDeliveriesByAutopilot(ctx context.Context, arg List
 			&i.SignatureStatus,
 			&i.Status,
 			&i.AttemptCount,
-			&i.SelectedHeaders,
 			&i.ContentType,
-			&i.RawBody,
 			&i.ResponseStatus,
-			&i.ResponseBody,
 			&i.AutopilotRunID,
 			&i.ReplayedFromDeliveryID,
 			&i.Error,

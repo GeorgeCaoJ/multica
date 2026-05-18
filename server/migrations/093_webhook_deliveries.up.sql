@@ -42,8 +42,18 @@ CREATE TABLE IF NOT EXISTS webhook_delivery (
     dedupe_source TEXT,
     signature_status TEXT NOT NULL DEFAULT 'not_required'
         CHECK (signature_status IN ('not_required', 'valid', 'invalid', 'missing')),
+    -- Delivery status tracks the *ingress*, not the autopilot run:
+    --   queued     — INSERTed, dispatch not yet attempted
+    --   dispatched — handed off to AutopilotService; autopilot_run_id is set.
+    --                A run that was admission-skipped (e.g. runtime offline)
+    --                still lives here — the skipped-ness is recorded on
+    --                autopilot_run.status, not on the delivery, so the
+    --                Deliveries enum stays unambiguous.
+    --   rejected   — signature verification failed (invalid or missing)
+    --   ignored    — trigger disabled / autopilot paused / archived
+    --   failed     — dispatch attempted and errored
     status TEXT NOT NULL DEFAULT 'queued'
-        CHECK (status IN ('queued', 'dispatched', 'skipped', 'rejected', 'ignored', 'failed')),
+        CHECK (status IN ('queued', 'dispatched', 'rejected', 'ignored', 'failed')),
     attempt_count INTEGER NOT NULL DEFAULT 1,
     -- Selected headers we want to keep for debugging (user-agent, event,
     -- delivery id, idempotency key, signature presence). NOT the raw header
@@ -72,15 +82,14 @@ CREATE INDEX IF NOT EXISTS idx_webhook_delivery_autopilot
 
 -- Provider-supplied dedupe identifiers must be unique per trigger. Partial so
 -- that NULL keys (no Idempotency-Key / X-GitHub-Delivery header) never
--- collide. `rejected` is excluded because a delivery that failed signature
--- verification (or otherwise never reached dispatch) must not block the
--- operator from resending the same event after fixing the secret — providers
--- like GitHub do not vary X-GitHub-Delivery across retries of the same event,
--- so a permanently-blocking rejected row would strand recovery on the wrong
--- side of a misconfiguration.
+-- collide. Terminal-but-not-successful outcomes (`rejected`, `failed`) are
+-- excluded so a transient ingress failure or a misconfigured secret does
+-- not strand the operator: providers like GitHub keep X-GitHub-Delivery
+-- stable across retries, and a permanently-blocking row would prevent the
+-- next retry from ever being dispatched.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_webhook_delivery_dedupe
     ON webhook_delivery(trigger_id, dedupe_key)
-    WHERE dedupe_key IS NOT NULL AND status <> 'rejected';
+    WHERE dedupe_key IS NOT NULL AND status NOT IN ('rejected', 'failed');
 
 -- Lookup by linked run (sync flows, gc check, run-detail "what triggered me").
 CREATE INDEX IF NOT EXISTS idx_webhook_delivery_run

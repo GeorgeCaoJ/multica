@@ -30,14 +30,15 @@ WHERE id = $1 AND workspace_id = $2;
 -- name: GetWebhookDeliveryByTriggerAndDedupe :one
 -- Looks up the existing delivery for a (trigger, dedupe_key) pair so that
 -- duplicate requests return the original delivery_id / autopilot_run_id.
--- Prefer non-rejected rows: the partial unique index allows multiple rejected
--- attempts with the same key, so without the ORDER BY we could return a
--- stale rejection even after the operator fixed the secret and a fresh
--- dispatch succeeded.
+-- The partial unique index excludes terminal-but-not-successful statuses
+-- (`rejected`, `failed`), so multiple such rows can coexist for the same
+-- key. Prefer non-terminal rows in the lookup: without the ORDER BY we
+-- could return a stale rejection / failure even after the operator fixed
+-- the cause and a fresh dispatch succeeded.
 SELECT * FROM webhook_delivery
 WHERE trigger_id = $1
   AND dedupe_key = $2
-ORDER BY (status = 'rejected'), created_at DESC
+ORDER BY (status IN ('rejected', 'failed')), created_at DESC
 LIMIT 1;
 
 -- name: BumpWebhookDeliveryAttempt :one
@@ -79,7 +80,18 @@ RETURNING *;
 -- name: ListWebhookDeliveriesByAutopilot :many
 -- Workspace-scoped via the join so a runId from another workspace cannot
 -- leak. Newest first, paged by limit/offset.
-SELECT d.*
+--
+-- Projection: large columns (`raw_body`, `selected_headers`, `response_body`)
+-- are deliberately excluded. A 100-row page × 256 KiB raw_body would be
+-- 25 MiB of bytes pulled from Postgres just to be dropped in the JSON
+-- encoder — Deliveries tab would hit that on every reload. Detail views
+-- fetch the full row via GetWebhookDelivery / GetWebhookDeliveryInWorkspace.
+SELECT
+    d.id, d.workspace_id, d.autopilot_id, d.trigger_id, d.provider, d.event,
+    d.dedupe_key, d.dedupe_source, d.signature_status, d.status,
+    d.attempt_count, d.content_type, d.response_status,
+    d.autopilot_run_id, d.replayed_from_delivery_id, d.error,
+    d.received_at, d.last_attempt_at, d.created_at
 FROM webhook_delivery d
 JOIN autopilot a ON a.id = d.autopilot_id
 WHERE d.autopilot_id = $1

@@ -58,13 +58,17 @@ const (
 )
 
 // delivery status values mirror the CHECK constraint on webhook_delivery.
-// Duplicate requests don't get their own row — they bump attempt_count on
-// the existing dedupe target and the handler returns a "duplicate" *response
-// status* without persisting that string anywhere.
+//
+// "Duplicate" is a *response* status, not a delivery status — duplicates
+// don't get their own row; they bump attempt_count on the existing dedupe
+// target. Likewise "skipped" is a *response* status reported when the
+// autopilot service skipped the run (e.g. runtime offline); the delivery
+// row itself records `dispatched` and links the skipped run via
+// autopilot_run_id, because from the ingress's perspective we DID hand
+// the payload to the autopilot machinery.
 const (
 	deliveryStatusQueued     = "queued"
 	deliveryStatusDispatched = "dispatched"
-	deliveryStatusSkipped    = "skipped"
 	deliveryStatusRejected   = "rejected"
 	deliveryStatusIgnored    = "ignored"
 	deliveryStatusFailed     = "failed"
@@ -536,7 +540,15 @@ func (h *Handler) HandleAutopilotWebhook(w http.ResponseWriter, r *http.Request)
 			"error", err,
 		)
 		respBody := map[string]any{"error": "failed to dispatch autopilot"}
-		h.finaliseDeliveryTerminal(r, delivery.ID, deliveryStatusFailed, http.StatusInternalServerError, respBody, err.Error())
+		// DispatchAutopilot may return a non-nil run alongside an error
+		// (e.g. when the run row was created but the downstream dispatch
+		// failed). Link the run on the delivery anyway so the Deliveries
+		// UI can show which run row corresponds to the failure.
+		if run != nil {
+			h.finaliseDeliveryWithRun(r, delivery.ID, deliveryStatusFailed, run.ID, http.StatusInternalServerError, respBody)
+		} else {
+			h.finaliseDeliveryTerminal(r, delivery.ID, deliveryStatusFailed, http.StatusInternalServerError, respBody, err.Error())
+		}
 		writeJSON(w, http.StatusInternalServerError, respBody)
 		return
 	}
@@ -551,10 +563,14 @@ func (h *Handler) HandleAutopilotWebhook(w http.ResponseWriter, r *http.Request)
 	}
 
 	// 13. Persist the linkage delivery → run.
-	deliveryStatus := deliveryStatusDispatched
-	if run.Status == "skipped" {
-		deliveryStatus = deliveryStatusSkipped
-	}
+	//
+	// The delivery row is always `dispatched` once we reach here: from the
+	// ingress's perspective we handed the payload off to the autopilot
+	// machinery and got a run id back. The autopilot may have skipped the
+	// run (e.g. runtime offline) — that's reflected in the response status
+	// + reason and in the linked run row, not in the delivery status. This
+	// keeps the delivery enum tight and the Deliveries UI unambiguous
+	// (`run.status` is the source of truth for what the run did).
 	respBody := map[string]any{
 		"status":       "accepted",
 		"delivery_id":  uuidToString(delivery.ID),
@@ -572,7 +588,7 @@ func (h *Handler) HandleAutopilotWebhook(w http.ResponseWriter, r *http.Request)
 			respBody["reason"] = run.FailureReason.String
 		}
 	}
-	h.finaliseDeliveryWithRun(r, delivery.ID, deliveryStatus, run.ID, http.StatusOK, respBody)
+	h.finaliseDeliveryWithRun(r, delivery.ID, deliveryStatusDispatched, run.ID, http.StatusOK, respBody)
 
 	writeJSON(w, http.StatusOK, respBody)
 }

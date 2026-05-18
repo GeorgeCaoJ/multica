@@ -49,6 +49,45 @@ type WebhookDeliveryResponse struct {
 	ResponseBody    *string         `json:"response_body,omitempty"`
 }
 
+// slimDeliveryToResponse maps the projected list row (no raw_body /
+// selected_headers / response_body) into the wire response shape.
+func slimDeliveryToResponse(d db.ListWebhookDeliveriesByAutopilotRow) WebhookDeliveryResponse {
+	resp := WebhookDeliveryResponse{
+		ID:              uuidToString(d.ID),
+		WorkspaceID:     uuidToString(d.WorkspaceID),
+		AutopilotID:     uuidToString(d.AutopilotID),
+		TriggerID:       uuidToString(d.TriggerID),
+		Provider:        d.Provider,
+		Event:           d.Event,
+		DedupeKey:       textToPtr(d.DedupeKey),
+		DedupeSource:    textToPtr(d.DedupeSource),
+		SignatureStatus: d.SignatureStatus,
+		Status:          d.Status,
+		AttemptCount:    d.AttemptCount,
+		ContentType:     textToPtr(d.ContentType),
+		ReceivedAt:      timestampToString(d.ReceivedAt),
+		LastAttemptAt:   timestampToString(d.LastAttemptAt),
+		CreatedAt:       timestampToString(d.CreatedAt),
+	}
+	if d.ResponseStatus.Valid {
+		v := d.ResponseStatus.Int32
+		resp.ResponseStatus = &v
+	}
+	if d.AutopilotRunID.Valid {
+		v := uuidToString(d.AutopilotRunID)
+		resp.AutopilotRunID = &v
+	}
+	if d.ReplayedFromDeliveryID.Valid {
+		v := uuidToString(d.ReplayedFromDeliveryID)
+		resp.ReplayedFromDeliveryID = &v
+	}
+	if d.Error.Valid {
+		v := d.Error.String
+		resp.Error = &v
+	}
+	return resp
+}
+
 func deliveryToResponse(d db.WebhookDelivery, detail bool) WebhookDeliveryResponse {
 	resp := WebhookDeliveryResponse{
 		ID:              uuidToString(d.ID),
@@ -143,7 +182,7 @@ func (h *Handler) ListAutopilotDeliveries(w http.ResponseWriter, r *http.Request
 
 	resp := make([]WebhookDeliveryResponse, len(rows))
 	for i, row := range rows {
-		resp[i] = deliveryToResponse(row, false)
+		resp[i] = slimDeliveryToResponse(row)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"deliveries": resp, "total": len(resp)})
 }
@@ -266,7 +305,14 @@ func (h *Handler) ReplayAutopilotDelivery(w http.ResponseWriter, r *http.Request
 	)
 	if dispatchErr != nil {
 		respBody := map[string]any{"error": "failed to dispatch autopilot"}
-		h.finaliseDeliveryTerminal(r, replay.ID, deliveryStatusFailed, http.StatusInternalServerError, respBody, dispatchErr.Error())
+		// DispatchAutopilot may return a non-nil run alongside an error
+		// (see HandleAutopilotWebhook for the same rationale). Link the
+		// run on the failed delivery so Deliveries UI can surface it.
+		if run != nil {
+			h.finaliseDeliveryWithRun(r, replay.ID, deliveryStatusFailed, run.ID, http.StatusInternalServerError, respBody)
+		} else {
+			h.finaliseDeliveryTerminal(r, replay.ID, deliveryStatusFailed, http.StatusInternalServerError, respBody, dispatchErr.Error())
+		}
 		writeError(w, http.StatusInternalServerError, dispatchErr.Error())
 		return
 	}
@@ -275,10 +321,9 @@ func (h *Handler) ReplayAutopilotDelivery(w http.ResponseWriter, r *http.Request
 		slog.Warn("replay: failed to touch last_fired_at", "trigger_id", uuidToString(trigRow.ID), "error", err)
 	}
 
-	deliveryStatus := deliveryStatusDispatched
-	if run.Status == "skipped" {
-		deliveryStatus = deliveryStatusSkipped
-	}
+	// Delivery is always `dispatched` once a run is produced — even when
+	// the run itself was skipped (e.g. runtime offline). See the comment
+	// in HandleAutopilotWebhook for the rationale.
 	respBody := map[string]any{
 		"status":                    "accepted",
 		"delivery_id":               uuidToString(replay.ID),
@@ -293,7 +338,7 @@ func (h *Handler) ReplayAutopilotDelivery(w http.ResponseWriter, r *http.Request
 			respBody["reason"] = run.FailureReason.String
 		}
 	}
-	h.finaliseDeliveryWithRun(r, replay.ID, deliveryStatus, run.ID, http.StatusCreated, respBody)
+	h.finaliseDeliveryWithRun(r, replay.ID, deliveryStatusDispatched, run.ID, http.StatusCreated, respBody)
 
 	final, err := h.Queries.GetWebhookDelivery(r.Context(), replay.ID)
 	if err != nil {

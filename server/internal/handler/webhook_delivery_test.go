@@ -441,11 +441,26 @@ func TestGetDelivery_ReturnsFullPayload(t *testing.T) {
 	if wDetail.Code != http.StatusOK {
 		t.Fatalf("detail: %d body=%s", wDetail.Code, wDetail.Body.String())
 	}
-	if !bytes.Contains(wDetail.Body.Bytes(), []byte(`"raw_body"`)) {
+	// raw_body is serialised as a JSON string (escaped); decode the response
+	// and assert against the decoded payload so we don't rely on a brittle
+	// substring search against the escaped form.
+	var detail WebhookDeliveryResponse
+	if err := json.Unmarshal(wDetail.Body.Bytes(), &detail); err != nil {
+		t.Fatalf("decode detail: %v body=%s", err, wDetail.Body.String())
+	}
+	if detail.RawBody == nil {
 		t.Fatalf("detail should include raw_body: %s", wDetail.Body.String())
 	}
-	if !bytes.Contains(wDetail.Body.Bytes(), []byte(`"answer":42`)) {
-		t.Fatalf("detail raw_body should carry original payload: %s", wDetail.Body.String())
+	var raw map[string]any
+	if err := json.Unmarshal([]byte(*detail.RawBody), &raw); err != nil {
+		t.Fatalf("raw_body should be valid JSON: %v body=%q", err, *detail.RawBody)
+	}
+	payload, ok := raw["eventPayload"].(map[string]any)
+	if !ok {
+		t.Fatalf("eventPayload missing or wrong type in raw_body: %#v", raw)
+	}
+	if v, ok := payload["answer"].(float64); !ok || v != 42 {
+		t.Fatalf("raw_body eventPayload.answer should be 42, got %#v", payload["answer"])
 	}
 }
 
@@ -593,6 +608,79 @@ func TestWebhookHandler_IgnoredPathStillPersistsDelivery(t *testing.T) {
 	}
 	if deliveries[0]["status"] != "ignored" {
 		t.Fatalf("status: %v", deliveries[0]["status"])
+	}
+}
+
+// A `failed` delivery (e.g. transient dispatch error) must NOT permanently
+// dedupe-block the provider's retry of the same event. GitHub keeps
+// `X-GitHub-Delivery` stable across retries; if the unique index trapped
+// the `failed` row, the second attempt would come back as `duplicate` and
+// the event would be lost.
+//
+// The handler-level failure path is hard to force in tests (most reasons
+// route through the admission check and produce a skipped run instead),
+// so we exercise the partial unique index directly: insert a `failed`
+// row, then a fresh `dispatched` row with the same dedupe_key — the
+// index excludes both `rejected` and `failed`, so both INSERTs must
+// succeed.
+func TestWebhookDelivery_FailedRowDoesNotBlockDedupe(t *testing.T) {
+	ctx := context.Background()
+	agentID := createWebhookTestAgent(t, "FailedRetry Agent")
+	apID := createWebhookTestAutopilot(t, agentID, "active", "run_only")
+	trig := createWebhookTriggerViaHandler(t, apID)
+
+	first, err := testHandler.Queries.CreateWebhookDelivery(ctx, db.CreateWebhookDeliveryParams{
+		WorkspaceID:     parseUUID(testWorkspaceID),
+		AutopilotID:     parseUUID(apID),
+		TriggerID:       parseUUID(trig.ID),
+		Provider:        "github",
+		Event:           "github.pull_request",
+		SignatureStatus: "not_required",
+		Status:          "failed",
+		SelectedHeaders: []byte("{}"),
+		DedupeKey:       pgtype.Text{String: "retry-key", Valid: true},
+		DedupeSource:    pgtype.Text{String: "x-github-delivery", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("insert failed row: %v", err)
+	}
+
+	// Same dedupe_key, status=dispatched. Must succeed: the partial unique
+	// index excludes both `rejected` and `failed`, so the prior `failed`
+	// row does not consume the slot.
+	second, err := testHandler.Queries.CreateWebhookDelivery(ctx, db.CreateWebhookDeliveryParams{
+		WorkspaceID:     parseUUID(testWorkspaceID),
+		AutopilotID:     parseUUID(apID),
+		TriggerID:       parseUUID(trig.ID),
+		Provider:        "github",
+		Event:           "github.pull_request",
+		SignatureStatus: "not_required",
+		Status:          "dispatched",
+		SelectedHeaders: []byte("{}"),
+		DedupeKey:       pgtype.Text{String: "retry-key", Valid: true},
+		DedupeSource:    pgtype.Text{String: "x-github-delivery", Valid: true},
+	})
+	if err != nil {
+		t.Fatalf("retry insert blocked by stale failed row: %v", err)
+	}
+	if uuidToString(second.ID) == uuidToString(first.ID) {
+		t.Fatal("retry should produce a fresh row, not reuse the failed one")
+	}
+
+	// And the dedupe lookup MUST prefer the non-terminal (dispatched) row,
+	// not the stale `failed` one, so a third attempt collapses onto the
+	// successful delivery rather than the failure.
+	got, err := testHandler.Queries.GetWebhookDeliveryByTriggerAndDedupe(ctx,
+		db.GetWebhookDeliveryByTriggerAndDedupeParams{
+			TriggerID: parseUUID(trig.ID),
+			DedupeKey: pgtype.Text{String: "retry-key", Valid: true},
+		})
+	if err != nil {
+		t.Fatalf("lookup: %v", err)
+	}
+	if got.Status != "dispatched" {
+		t.Fatalf("lookup should prefer non-terminal row, got status=%q (id=%s)",
+			got.Status, uuidToString(got.ID))
 	}
 }
 
