@@ -285,6 +285,33 @@ export function createZhDict(allowSignup: boolean): LandingDict {
     },
     entries: [
       {
+        version: "0.3.3",
+        date: "2026-05-19",
+        title: "项目时间线、运行环境设置与更清晰的任务协作",
+        changes: [],
+        features: [
+          "项目现在提供甘特图视图，用于查看有排期的工作，并会在计划变化时实时同步",
+          "Workspace 管理员可以在设置中调整 Issue 编号前缀，命令行也能切换 workspace 并查看当前 workspace",
+          "Agent 现在可以优先读取最新的 Issue 讨论线程，后续跟进和审查更贴近当前上下文",
+          "Usage 新增 1 天视图和按周趋势，并会遵循所选时区",
+          "Agent 详情页新增紧凑任务列表和 Issue 搜索，查看工作负载更快",
+        ],
+        improvements: [
+          "Onboarding 改为一次回答一个问题，并能用更少步骤引导 runtime 设置",
+          "添加电脑的流程更简单，选项更清楚，准备本地运行环境更省心",
+          "My Issues 会包含分配给 squad 的工作，相关标签也更容易理解",
+          "查看 agent transcript 时可以切换排序方向，回看运行过程更方便",
+          "项目时间线现在聚焦有排期的事项，相关工作变化时会自动更新",
+        ],
+        fixes: [
+          "桌面端打开 HTML 预览更稳定，必要时会关闭全屏窗口，并支持页面内链接跳转",
+          "HTML 源码视图和附件预览更容易检查，也可以把内容打开到新标签页",
+          "切换创建 Issue 模式时，提示词里不再残留旧的手写草稿",
+          "Runtime 任务会从任务目录读取正确的 workspace 指令和 skills",
+          "自托管团队可以设置登录会话有效期",
+        ],
+      },
+      {
         version: "0.3.2",
         date: "2026-05-18",
         title: "Webhook 自动任务、更清晰的工作看板与更稳的运行环境",
