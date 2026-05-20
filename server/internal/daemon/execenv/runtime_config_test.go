@@ -28,6 +28,16 @@ func TestParentSubIssueProtocolEmittedForAssignmentTrigger(t *testing.T) {
 	// the `backlog` vs `todo` sub-issue creation semantics.
 	for _, want := range []string{
 		"best-effort",
+		// Preamble must frame rules generically for parent/child work, NOT
+		// globally gate on the current issue having `parent_issue_id`
+		// (Elon's review on PR #2918: rule 3 still applies to top-level
+		// parents that have no parent themselves).
+		"For parent/child work",
+		// Rules 1 and 2 carry the per-rule gating instead.
+		"**Closing out child work** (only if this issue has `parent_issue_id`)",
+		"**Notify the parent** (only if this issue has `parent_issue_id` and you are closing out child work)",
+		// Rule 3 must explicitly apply to any issue-bound run.
+		"**Creating sub-issues** (applies to any issue-bound run)",
 		// rule 1 — assignment branch keeps the unconditional in_review flip
 		"`multica issue status <this-issue-id> in_review`",
 		// rule 2 — top-level parent comment + simplified mention rule
@@ -62,6 +72,10 @@ func TestParentSubIssueProtocolEmittedForAssignmentTrigger(t *testing.T) {
 		// convention, not a spec.
 		"### A. Notify the parent",
 		"### B. Choose",
+		// The previous revision wrapped all three rules in a single
+		// `parent_issue_id` gate; the current revision must instead gate
+		// per-rule so rule 3 still reaches top-level parents.
+		"When this issue has `parent_issue_id`:",
 	} {
 		if strings.Contains(out, banned) {
 			t.Errorf("expected %q to be removed", banned)
@@ -183,6 +197,60 @@ func TestAssignmentTriggeredProtocolStillFlipsInReview(t *testing.T) {
 
 	if !strings.Contains(out, "`multica issue status <this-issue-id> in_review`") {
 		t.Errorf("assignment-triggered Step A must keep the unconditional `multica issue status <this-issue-id> in_review` flip")
+	}
+}
+
+// Rule 3 (creating sub-issues) must apply to any issue-bound run, not only
+// those whose current issue already has a `parent_issue_id`. A top-level
+// parent issue is exactly where the `todo` vs `backlog` decision matters most
+// (it is the one spawning children) — gating rule 3 behind parent_issue_id
+// would silently drop the guidance in that case (Elon's review on PR #2918).
+func TestSubIssueCreationRuleIsUnconditional(t *testing.T) {
+	t.Parallel()
+	ctx := TaskContextForEnv{
+		IssueID: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+	}
+	out := buildMetaSkillContent("claude", ctx)
+
+	const header = "## Parent / Sub-issue Protocol"
+	start := strings.Index(out, header)
+	if start == -1 {
+		t.Fatalf("protocol section missing")
+	}
+	rest := out[start:]
+	end := strings.Index(rest[len(header):], "\n## ")
+	var section string
+	if end == -1 {
+		section = rest
+	} else {
+		section = rest[:len(header)+end]
+	}
+
+	// The preamble must NOT globally gate the whole protocol on the
+	// current issue having `parent_issue_id`.
+	if strings.Contains(section, "When this issue has `parent_issue_id`:") {
+		t.Errorf("preamble must not globally gate the protocol on `parent_issue_id` — rule 3 needs to reach top-level parents too")
+	}
+
+	// Find rule 3 and check it does NOT carry the `parent_issue_id` gate.
+	rule3Idx := strings.Index(section, "3. **Creating sub-issues**")
+	if rule3Idx == -1 {
+		t.Fatalf("rule 3 (Creating sub-issues) missing from protocol section")
+	}
+	rule3 := section[rule3Idx:]
+	if strings.Contains(rule3, "parent_issue_id") {
+		t.Errorf("rule 3 (Creating sub-issues) must not be gated by `parent_issue_id`; it applies to any issue-bound run:\n%s", rule3)
+	}
+
+	// Rules 1 and 2 must carry the gate (the inverse boundary — if these
+	// lose the gate, the agent would post to a parent that does not exist).
+	for _, want := range []string{
+		"**Closing out child work** (only if this issue has `parent_issue_id`)",
+		"**Notify the parent** (only if this issue has `parent_issue_id` and you are closing out child work)",
+	} {
+		if !strings.Contains(section, want) {
+			t.Errorf("rule 1 or 2 missing per-rule `parent_issue_id` gate %q", want)
+		}
 	}
 }
 
