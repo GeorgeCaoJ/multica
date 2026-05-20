@@ -367,15 +367,8 @@ func buildMetaSkillContent(provider string, ctx TaskContextForEnv) string {
 		} else {
 			b.WriteString("1. Post your final-results comment on **this** issue and run `multica issue status <this-issue-id> in_review`. Your own issue remains the source of truth for what you did; do not put the deliverable in the parent comment.\n")
 		}
-		b.WriteString("2. Run `multica issue get <parent-id> --output json` and read `assignee_id`, `assignee_type`, and `status`. If this call fails (parent removed, no access), skip the notification — do not block your own finish over it.\n")
-		b.WriteString("3. Post a single **top-level** comment on the parent issue (`multica issue comment add <parent-id> ...` with NO `--parent`). Follow the comment-formatting rules already in this brief for the current provider when choosing between `--content`, `--content-stdin`, and `--content-file`. The body should reference this child as `[MUL-<num>](mention://issue/<child-id>)`, state the child's current status, and give a one-line outcome plus whatever link the parent agent needs to decide the next step.\n\n")
-		b.WriteString("Mention rules for that parent-side comment — these prevent loops, do not weaken them:\n\n")
-		b.WriteString("| Parent assignee | Parent status | Mention in your comment? |\n")
-		b.WriteString("|---|---|---|\n")
-		b.WriteString("| Another agent (not you) | not `done` / `cancelled` | **Yes** — `[@Name](mention://agent/<parent-agent-id>)` to wake them |\n")
-		b.WriteString("| The same agent as yourself | any | **No** — never `@` yourself; you will read your own comment next time you run on the parent |\n")
-		b.WriteString("| Member or squad | any | **No** `@mention` — refer to them in plain text if needed |\n")
-		b.WriteString("| Any assignee | `done` or `cancelled` | **No** mention — do not re-trigger a closed issue |\n\n")
+		b.WriteString("2. Run `multica issue get <parent-id> --output json` and read `assignee_id` and `assignee_type`. If this call fails (parent removed, no access), skip the notification — do not block your own finish over it.\n")
+		b.WriteString("3. Post a single **top-level** comment on the parent issue (`multica issue comment add <parent-id> ...` with NO `--parent`). Follow the comment-formatting rules already in this brief for the current provider when choosing between `--content`, `--content-stdin`, and `--content-file`. The body should reference this child as `[MUL-<num>](mention://issue/<child-id>)`, state the child's current status, give a one-line outcome plus whatever link the parent owner needs, and `@mention` the parent's assignee using the URL that matches `assignee_type` — `mention://agent/<id>`, `mention://member/<id>`, or `mention://squad/<id>`. If the parent has no assignee, post the same comment without an `@mention`. Don't try to second-guess the mention (same agent as yourself, parent already closed, etc.) — the platform's dedup handles re-triggers, and mentioning the assignee is the simple, predictable rule.\n\n")
 		b.WriteString("This signal is best-effort, not a guaranteed handshake. Treat it as the parent's hint that a child is ready for review.\n\n")
 
 		b.WriteString("### B. Choose `backlog` vs `todo` when creating sub-issues\n\n")

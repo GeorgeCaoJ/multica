@@ -34,16 +34,32 @@ func TestParentSubIssueProtocolEmittedForAssignmentTrigger(t *testing.T) {
 			t.Errorf("behavior A missing %q", want)
 		}
 	}
-	// Mention table — every row must be present so loop-prevention rules
-	// stay visible.
+	// Simplified mention rule (Bohan's directive on PR #2918): always
+	// `@mention` the parent's assignee using the URL that matches
+	// `assignee_type`, with no per-case branching. The brief must
+	// teach all three mention URLs and tell the agent not to second-guess.
 	for _, want := range []string{
-		"Another agent (not you)",
-		"The same agent as yourself",
-		"Member or squad",
-		"`done` or `cancelled`",
+		"`@mention` the parent's assignee",
+		"`mention://agent/<id>`",
+		"`mention://member/<id>`",
+		"`mention://squad/<id>`",
+		"no assignee",
+		"Don't try to second-guess",
 	} {
 		if !strings.Contains(out, want) {
-			t.Errorf("mention table missing row %q", want)
+			t.Errorf("simplified mention rule missing %q", want)
+		}
+	}
+	// And the previous per-case mention table must be gone — the whole
+	// point of this revision is to drop the same-agent / member / squad /
+	// closed-parent branches.
+	for _, banned := range []string{
+		"| Parent assignee | Parent status |",
+		"The same agent as yourself",
+		"| Member or squad |",
+	} {
+		if strings.Contains(out, banned) {
+			t.Errorf("expected the per-case mention table row %q to be removed", banned)
 		}
 	}
 	// Behavior B — backlog vs todo decision.
