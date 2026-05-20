@@ -131,4 +131,21 @@ describe("TabBar hover action buttons", () => {
     const pinnedTab = getByLabelText("Issues (pinned)");
     expect(within(pinnedTab).getByText("Issues")).toBeTruthy();
   });
+
+  it("renders the Pin glyph as the leading icon on a pinned tab and the route icon on an unpinned tab", () => {
+    state.byWorkspace.acme.tabs = [
+      { id: "tA", path: "/acme/issues", title: "Issues", icon: "ListTodo", pinned: true },
+      { id: "tB", path: "/acme/projects", title: "Projects", icon: "ListTodo", pinned: false },
+    ];
+    const { getByLabelText } = render(<TabBar />);
+    const pinnedTab = getByLabelText("Issues (pinned)");
+    const unpinnedTab = getByLabelText("Projects");
+    // lucide-react renders the icon name into the class list. The leading
+    // slot icon is size-3.5; the hover Pin/Unpin action button is size-2.5,
+    // so we qualify on size to avoid matching the action glyph.
+    expect(pinnedTab.querySelector(".lucide-pin.size-3\\.5")).toBeTruthy();
+    expect(pinnedTab.querySelector(".lucide-list-todo")).toBeNull();
+    expect(unpinnedTab.querySelector(".lucide-list-todo.size-3\\.5")).toBeTruthy();
+    expect(unpinnedTab.querySelector(".lucide-pin.size-3\\.5")).toBeNull();
+  });
 });

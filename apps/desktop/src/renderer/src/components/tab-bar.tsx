@@ -84,7 +84,11 @@ function SortableTabItem({
     isDragging,
   } = useSortable({ id: tab.id });
 
-  const Icon = TAB_ICONS[tab.icon];
+  // Pinned tabs swap the route icon for a Pin glyph as the static "I am
+  // pinned" indicator (RFC §3 D1v-iv FINAL). The route information is still
+  // present in the title, and this avoids a hard left accent border that read
+  // as visually heavy in light mode.
+  const LeadingIcon = tab.pinned ? Pin : TAB_ICONS[tab.icon];
 
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -112,10 +116,10 @@ function SortableTabItem({
     e.stopPropagation();
   };
 
-  // Pinned tabs keep their full title (RFC §3 D1v-ii FINAL). The only weak
-  // visual differences vs. unpinned tabs are the accent left border and the
-  // suppressed X (closing requires explicit Unpin). Pin/Unpin is reachable
-  // via the hover action button below and the right-click menu fallback.
+  // Pinned tabs keep their full title (RFC §3 D1v-ii FINAL). The only visual
+  // differences vs. unpinned tabs are the leading Pin icon (swapped in above)
+  // and the suppressed X (closing requires explicit Unpin). Pin/Unpin is
+  // reachable via the hover action button below and the right-click menu.
   const showCloseButton = !tab.pinned && !isOnly;
 
   const tabButton = (
@@ -133,11 +137,10 @@ function SortableTabItem({
         isActive
           ? "bg-sidebar-accent font-medium text-sidebar-accent-foreground"
           : "bg-sidebar-accent/50 text-muted-foreground hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
-        tab.pinned && "border-l-2 border-l-primary/60",
         isDragging && "opacity-60",
       )}
     >
-      {Icon && <Icon className="size-3.5 shrink-0" />}
+      {LeadingIcon && <LeadingIcon className="size-3.5 shrink-0" />}
       <span
         className="min-w-0 flex-1 overflow-hidden whitespace-nowrap text-left"
         style={{
