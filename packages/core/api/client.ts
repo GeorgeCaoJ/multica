@@ -870,8 +870,10 @@ export class ApiClient {
   }
 
   async deleteCloudRuntimeNode(nodeId: string): Promise<void> {
-    await this.fetch(`/api/cloud-runtime/nodes/${nodeId}`, {
+    await this.fetchRaw("/api/cloud-runtime/nodes", {
       method: "DELETE",
+      body: JSON.stringify({ id: nodeId }),
+      extraHeaders: { "Content-Type": "application/json" },
     });
   }
 
