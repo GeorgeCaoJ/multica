@@ -234,7 +234,7 @@ describe("ApiClient", () => {
     ).resolves.toMatchObject({ id: "", status: "" });
   });
 
-  it("deleteCloudRuntimeNode sends DELETE with JSON body containing node id", async () => {
+  it("deleteCloudRuntimeNode sends DELETE with JSON body containing instance id", async () => {
     const fetchMock = vi.fn().mockResolvedValueOnce(
       new Response(null, { status: 204 }),
     );
