@@ -442,6 +442,14 @@ no-op. The server emits the cursor headers (`X-Multica-Next-Before` /
 exact-boundary pages (e.g. `--tail 3` on a thread with exactly 3
 replies) intentionally return no cursor so callers stop paginating.
 
+When `--since` is combined with `--recent` or `--thread --tail`, the
+server additionally suppresses the cursor once the cursor target itself
+is older than `since`. Older pages walk strictly older rows, so they
+cannot satisfy `> since` either — emitting a cursor there would just
+hand back root-only pages until the caller reaches the start of the
+thread / issue. Incremental polling stops at the first page whose
+cursor target falls before the watermark.
+
 ### Subscribers
 
 ```bash

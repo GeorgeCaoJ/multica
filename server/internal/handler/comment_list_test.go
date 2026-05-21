@@ -883,6 +883,31 @@ func TestListComments_ThreadTailWithSinceFiltersAfterTail(t *testing.T) {
 		_, rows := listComments(t, fx.IssueID, v.Encode())
 		eqIDs(t, ids(rows), []string{fx.Root1}, "since past everything keeps root")
 	})
+
+	t.Run("tail overflow with since past oldest retained reply suppresses cursor", func(t *testing.T) {
+		// Recreate Elon's MUL-2421 v2 case: long thread, tail=2 overflows
+		// (3 replies exist, only top 2 kept), the page body still retains
+		// a fresher reply (r1b1 at base+3m), but the oldest reply on the
+		// retained page (r1b at base+2m) is already <= since (base+2m30s).
+		// Older replies are strictly older than r1b → strictly older than
+		// since → all guaranteed-filtered. Server must NOT emit a reply
+		// cursor; otherwise the agent walks root-only pages until the
+		// thread bottoms out.
+		v := url.Values{}
+		v.Set("thread", fx.Root1)
+		v.Set("tail", "2")
+		v.Set("since", fx.Base.Add(150*time.Second).UTC().Format(time.RFC3339Nano))
+		w, rows := listComments(t, fx.IssueID, v.Encode())
+		// Sanity-check the body precondition: we kept the fresher reply
+		// (r1b1, base+3m) but dropped r1b (base+2m) via since. If this
+		// assertion ever shifts, the cursor assertion below would be
+		// testing a different shape than the bug Elon described.
+		eqIDs(t, ids(rows), []string{fx.Root1, fx.R1b1}, "body keeps root + fresher reply only")
+		nb, nbid := nextReplyCursor(w)
+		if nb != "" || nbid != "" {
+			t.Fatalf("expected no cursor (older page is guaranteed-empty under since), got before=%q before_id=%q", nb, nbid)
+		}
+	})
 }
 
 // TestListComments_ThreadTailFlagCombinationRules locks the API-surface

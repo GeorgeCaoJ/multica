@@ -418,12 +418,24 @@ func (h *Handler) fetchCommentsForList(ctx context.Context, args fetchCommentsAr
 			// Emit a reply cursor only when we proved an older reply
 			// exists (hasMore). On an exact-boundary page (replyCount
 			// == tail with no overflow) hasMore is false and the cursor
-			// stays empty. The since filter does NOT suppress the
-			// cursor: each page walks strictly older replies, and a
-			// caller polling with `since` legitimately wants to scroll
-			// older history even when the current page has nothing new.
+			// stays empty.
+			//
+			// Additionally suppress the cursor when `since` is set and
+			// the oldest retained reply on this page is already <= since.
+			// The next page walks replies strictly older than that one,
+			// so every older reply has created_at strictly less — if the
+			// cursor target itself can't satisfy `> since`, no older
+			// reply can either, and continuing to paginate would only
+			// return root-only pages until the agent walks the entire
+			// pre-`since` history. This mirrors the head-thread guard on
+			// the recent + since path. Flagged by Elon's second review on
+			// MUL-2421.
 			res := fetchCommentsResult{Comments: out}
-			if hasMore && len(replies) > 0 {
+			emitCursor := hasMore && len(replies) > 0
+			if emitCursor && args.Since.Valid && !replies[0].CreatedAt.Time.After(args.Since.Time) {
+				emitCursor = false
+			}
+			if emitCursor {
 				oldest := replies[0]
 				res.NextBefore = oldest.CreatedAt.Time.UTC().Format(time.RFC3339Nano)
 				res.NextBeforeID = uuidToString(oldest.ID)
